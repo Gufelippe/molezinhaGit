@@ -29,7 +29,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/molezinha/molezinha/releases/latest/download/latest.json"
+        "https://github.com/Gufelippe/molezinhaGit/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJENUNENjU4N0U4ODBGMDkKUldRSkQ0aCtXTlpjTGNIS3hJOHNLYi9hanlCb0s1TmVTMFpBMEJMVHUyYW5xaDBYWStIWDNJM0EK"
     }

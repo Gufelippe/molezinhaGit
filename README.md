@@ -91,7 +91,7 @@ Já está pronto no repo:
 
 ### Uma vez só (depois do primeiro push no GitHub)
 
-1. Crie o repo e faça o push. Se o path **não** for `molezinha/molezinha`, ajuste `plugins.updater.endpoints` no `tauri.conf.json`.
+1. Crie o repo e faça o push. Se o path **não** for `Gufelippe/molezinhaGit`, ajuste `plugins.updater.endpoints` no `tauri.conf.json`.
 2. Rode `npm run updater:secret` e cole o valor em  
    **GitHub → Settings → Secrets and variables → Actions → New repository secret**  
    com o nome `TAURI_SIGNING_PRIVATE_KEY`.
