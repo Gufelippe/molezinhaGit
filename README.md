@@ -119,12 +119,21 @@ Já está pronto no repo:
 2. Commit, tag e push:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 3. O Action publica o instalador + `latest.json`.  
    No app instalado: **Configurações → Conta → Verificar atualização**.
+
+Credenciais do client vêm de `apps/desktop/.env.production` (URL + publishable key).  
+Opcional no GitHub Secrets (sobrescrevem o `.env.production` no CI):
+
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_PUBLISHABLE_KEY`
+- `VITE_CALLS_URL` — use o WebSocket do IP público da Oracle (`ws://SEU_IP:3001/ws`)
+
+> Se o app abrir só uma tela preta depois de atualizar, o build provavelmente saiu sem essas variáveis. Feche pelo tray, reinstale o `.exe` do release mais novo, ou rode um build local com `apps/desktop/.env`.
 
 > Se perder a chave privada, updates assinados param de funcionar — guarde um backup do arquivo `.key`.
 

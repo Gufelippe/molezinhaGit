@@ -206,6 +206,27 @@ body {
   min-height: 0;
 }
 
+.boot-error {
+  max-width: 28rem;
+  text-align: center;
+  gap: var(--sp-4);
+}
+
+.boot-error-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
+  color: var(--neo-text);
+}
+
+.boot-error-msg {
+  margin: 0;
+  line-height: var(--leading-body);
+  white-space: pre-wrap;
+}
+
 .app-root-body {
   flex: 1;
   min-height: 0;

@@ -237,8 +237,14 @@ export async function checkForAppUpdate(): Promise<UpdateCheckResult> {
       version: update.version,
       downloadAndInstall: async () => {
         await update.downloadAndInstall();
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await relaunch();
+        // On Windows the NSIS installer already relaunches the app (/R or
+        // basicUi auto-launch). Calling relaunch() here races the installer
+        // and can reopen a half-replaced binary as a black window.
+        const isWindows = navigator.userAgent.includes("Windows");
+        if (!isWindows) {
+          const { relaunch } = await import("@tauri-apps/plugin-process");
+          await relaunch();
+        }
       },
     };
   } catch (err) {
