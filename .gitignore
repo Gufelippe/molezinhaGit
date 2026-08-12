@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+.target/
+target/
+.env
+.env.local
+*.db
+.DS_Store
+Thumbs.db
+*.log
+apps/desktop/src-tauri/target/
+apps/server/dist/
+.turbo/
+*.local
+.vscode/
+.idea/
+
+# Tauri updater signing keys (never commit the private key)
+*.key
+*.key.pub
+.tauri/

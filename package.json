@@ -1,0 +1,18 @@
+{
+  "name": "molezinha",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:desktop": "npm run dev -w @molezinha/desktop",
+    "dev:server": "npm run dev -w @molezinha/server",
+    "build:desktop": "npm run build -w @molezinha/desktop",
+    "build:server": "npm run build -w @molezinha/server",
+    "tauri": "npm run tauri -w @molezinha/desktop",
+    "tauri:dev": "npm run tauri:dev -w @molezinha/desktop",
+    "updater:secret": "node ./scripts/show-updater-secret.mjs"
+  }
+}

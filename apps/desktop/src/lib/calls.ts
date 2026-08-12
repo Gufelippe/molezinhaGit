@@ -1,0 +1,890 @@
+import type { types as msTypes } from "mediasoup-client";
+import type { CallServerMessage, MediaSource } from "@molezinha/shared";
+import { CALLS_URL } from "./supabase";
+import {
+  applyVoiceProcessing,
+  buildAudioConstraints,
+  buildScreenConstraints,
+  buildVideoConstraints,
+  onVoiceSettingsChange,
+  readVoiceSettings,
+  videoBitrate,
+  type VoiceSettings,
+} from "./voiceSettings";
+
+type MsDevice = import("mediasoup-client").Device;
+
+export interface RemotePeerMedia {
+  peerId: string;
+  displayName: string;
+  /** Mic + camera tracks. */
+  stream: MediaStream;
+  /** Screen share video, when the peer is sharing. */
+  screenStream: MediaStream | null;
+  audioMuted: boolean;
+  videoMuted: boolean;
+}
+
+type MediaState = {
+  audioMuted: boolean;
+  videoEnabled: boolean;
+  screenSharing: boolean;
+  screenStream: MediaStream | null;
+};
+
+type Listener = (
+  peers: Map<string, RemotePeerMedia>,
+  localStream: MediaStream | null,
+  media: MediaState
+) => void;
+
+export class CallClient {
+  private ws: WebSocket | null = null;
+  private device: MsDevice | null = null;
+  private sendTransport: msTypes.Transport | null = null;
+  private recvTransport: msTypes.Transport | null = null;
+  private localStream: MediaStream | null = null;
+  private screenStream: MediaStream | null = null;
+  private audioProducer: msTypes.Producer | null = null;
+  private videoProducer: msTypes.Producer | null = null;
+  private screenProducer: msTypes.Producer | null = null;
+  private peers = new Map<string, RemotePeerMedia>();
+  private peerNames = new Map<string, string>();
+  private pending = new Map<string, (msg: CallServerMessage) => void>();
+  private listeners = new Set<Listener>();
+  private channelId: string | null = null;
+  private localUserId: string | null = null;
+  private localPeerIds = new Set<string>();
+  private joinGeneration = 0;
+  private joinLock: Promise<void> = Promise.resolve();
+  private audioMuted = false;
+  private videoEnabled = false;
+  /** Producers that arrived before recv transport was ready */
+  private pendingConsumes: Array<{
+    peerId: string;
+    producerId: string;
+    kind: "audio" | "video";
+    source: MediaSource;
+  }> = [];
+  private consumedProducers = new Set<string>();
+  private consumers = new Map<string, msTypes.Consumer>();
+  /** producerId → capture it came from, so screen tracks land on the right stream */
+  private remoteSources = new Map<string, MediaSource>();
+  private audioCtx: AudioContext | null = null;
+  private inputGainNode: GainNode | null = null;
+  private rawMicTrack: MediaStreamTrack | null = null;
+  private unsubVoiceSettings: (() => void) | null = null;
+
+  constructor() {
+    this.unsubVoiceSettings = onVoiceSettingsChange((s) => {
+      void this.applyLiveVoiceSettings(s);
+    });
+  }
+
+  onUpdate(fn: Listener) {
+    this.listeners.add(fn);
+    // Push current state immediately — join often finishes before CallBar mounts.
+    fn(new Map(this.peers), this.localStream, this.getMediaState());
+    return () => {
+      this.listeners.delete(fn);
+    };
+  }
+
+  getPeersSnapshot() {
+    return new Map(this.peers);
+  }
+
+  getLocalStream() {
+    return this.localStream;
+  }
+
+  getScreenStream() {
+    return this.screenStream;
+  }
+
+  private emit() {
+    const media = this.getMediaState();
+    for (const fn of this.listeners) fn(new Map(this.peers), this.localStream, media);
+  }
+
+  getMediaState(): MediaState {
+    return {
+      audioMuted: this.audioMuted,
+      videoEnabled: this.videoEnabled,
+      screenSharing: Boolean(this.screenProducer && !this.screenProducer.closed),
+      screenStream: this.screenStream,
+    };
+  }
+
+  private waitFor<T extends CallServerMessage["type"]>(
+    type: T,
+    match?: (msg: Extract<CallServerMessage, { type: T }>) => boolean
+  ): Promise<Extract<CallServerMessage, { type: T }>> {
+    return new Promise((resolve, reject) => {
+      const id = `${type}:${crypto.randomUUID()}`;
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Timeout waiting for ${type}`));
+      }, 15000);
+
+      this.pending.set(id, (msg) => {
+        if (msg.type !== type) return;
+        if (match && !match(msg as Extract<CallServerMessage, { type: T }>)) return;
+        clearTimeout(timer);
+        this.pending.delete(id);
+        resolve(msg as Extract<CallServerMessage, { type: T }>);
+      });
+    });
+  }
+
+  private handleMessage(msg: CallServerMessage) {
+    for (const cb of this.pending.values()) cb(msg);
+
+    if (msg.type === "error") {
+      console.error("[call]", msg.message);
+      return;
+    }
+
+    if (msg.type === "peerJoined") {
+      if (this.localUserId && msg.peer.userId === this.localUserId) {
+        this.localPeerIds.add(msg.peer.peerId);
+        return;
+      }
+      this.peerNames.set(msg.peer.peerId, msg.peer.displayName);
+      // Show tile immediately — media tracks arrive via consume/newProducer.
+      if (!this.peers.has(msg.peer.peerId)) {
+        this.peers.set(msg.peer.peerId, {
+          peerId: msg.peer.peerId,
+          displayName: msg.peer.displayName,
+          stream: new MediaStream(),
+          screenStream: null,
+          audioMuted: false,
+          videoMuted: true,
+        });
+        this.emit();
+      }
+      return;
+    }
+
+    if (msg.type === "peerLeft") {
+      this.localPeerIds.delete(msg.peerId);
+      this.peers.delete(msg.peerId);
+      this.peerNames.delete(msg.peerId);
+      this.emit();
+      return;
+    }
+
+    if (msg.type === "newProducer") {
+      if (this.localPeerIds.has(msg.peerId)) return;
+      void this.consumeProducer(
+        msg.peerId,
+        msg.producerId,
+        msg.kind,
+        msg.appData?.source ?? (msg.kind === "audio" ? "mic" : "camera")
+      );
+      return;
+    }
+
+    if (msg.type === "producerClosed") {
+      const source = this.remoteSources.get(msg.producerId);
+      this.remoteSources.delete(msg.producerId);
+      const consumer = this.consumers.get(msg.producerId);
+      if (consumer) {
+        try {
+          consumer.close();
+        } catch {
+          /* ignore */
+        }
+        this.consumers.delete(msg.producerId);
+        this.consumedProducers.delete(msg.producerId);
+        const peer = this.peers.get(msg.peerId);
+        if (peer) {
+          const target = source === "screen" ? peer.screenStream : peer.stream;
+          try {
+            target?.removeTrack(consumer.track);
+          } catch {
+            /* ignore */
+          }
+          try {
+            consumer.track.stop();
+          } catch {
+            /* ignore */
+          }
+          this.refreshPeerStreams(peer);
+          this.peers.set(msg.peerId, { ...peer });
+          this.emit();
+        }
+        return;
+      }
+      const peer = this.peers.get(msg.peerId);
+      if (!peer) return;
+      for (const stream of [peer.stream, peer.screenStream]) {
+        if (!stream) continue;
+        for (const track of [...stream.getTracks()]) {
+          if (track.readyState === "ended") {
+            stream.removeTrack(track);
+            track.stop();
+          }
+        }
+      }
+      this.refreshPeerStreams(peer);
+      this.peers.set(msg.peerId, { ...peer });
+      this.emit();
+      return;
+    }
+
+    if (msg.type === "peerMute") {
+      const peer = this.peers.get(msg.peerId);
+      if (!peer) return;
+      if (msg.kind === "audio") peer.audioMuted = msg.muted;
+      if (msg.kind === "video") peer.videoMuted = msg.muted;
+      this.emit();
+    }
+  }
+
+  /** Rebuild stream identities (React needs new refs) and recompute video state. */
+  private refreshPeerStreams(peer: RemotePeerMedia) {
+    peer.videoMuted = !peer.stream.getVideoTracks().some((t) => t.readyState === "live");
+    peer.stream = new MediaStream(peer.stream.getTracks());
+    const screenTracks =
+      peer.screenStream?.getTracks().filter((t) => t.readyState === "live") ?? [];
+    peer.screenStream = screenTracks.length ? new MediaStream(screenTracks) : null;
+  }
+
+  private send(payload: unknown) {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch (err) {
+      console.warn("[call] send failed", err);
+    }
+  }
+
+  private clearPending() {
+    this.pending.clear();
+  }
+
+  async join(
+    channelId: string,
+    token: string,
+    opts: { audio: boolean; video: boolean; muteOnJoin: boolean; userId: string }
+  ) {
+    const run = async () => {
+      await this.leaveInternal();
+      this.channelId = channelId;
+      this.localUserId = opts.userId;
+      this.localPeerIds.clear();
+      const generation = ++this.joinGeneration;
+
+      await new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(CALLS_URL);
+        this.ws = ws;
+
+        const fail = (message: string) => {
+          if (this.joinGeneration !== generation) return;
+          reject(new Error(message));
+        };
+
+        ws.onopen = () => {
+          if (this.joinGeneration !== generation || this.ws !== ws) return;
+          resolve();
+        };
+        ws.onerror = () => fail("Falha ao conectar no servidor de calls");
+        ws.onclose = () => {
+          if (this.joinGeneration === generation && this.ws === ws) {
+            this.ws = null;
+          }
+        };
+        ws.onmessage = (ev) => {
+          if (this.joinGeneration !== generation) return;
+          try {
+            this.handleMessage(JSON.parse(String(ev.data)) as CallServerMessage);
+          } catch {
+            /* ignore */
+          }
+        };
+      });
+
+      if (this.joinGeneration !== generation) {
+        throw new Error("Entrada na call cancelada");
+      }
+
+      const joinedPromise = this.waitFor("joined");
+      this.send({ type: "join", channelId, token });
+      const joined = await joinedPromise;
+
+      if (this.joinGeneration !== generation) {
+        throw new Error("Entrada na call cancelada");
+      }
+
+      for (const p of joined.peers) {
+        if (p.userId === opts.userId) {
+          this.localPeerIds.add(p.peerId);
+          continue;
+        }
+        this.peerNames.set(p.peerId, p.displayName);
+        if (!this.peers.has(p.peerId)) {
+          this.peers.set(p.peerId, {
+            peerId: p.peerId,
+            displayName: p.displayName,
+            stream: new MediaStream(),
+            screenStream: null,
+            audioMuted: false,
+            videoMuted: true,
+          });
+        }
+      }
+      this.emit();
+
+      const { Device } = await import("mediasoup-client");
+      this.device = new Device();
+      await this.device.load({
+        routerRtpCapabilities: joined.routerRtpCapabilities as msTypes.RtpCapabilities,
+      });
+
+      this.sendTransport = await this.createTransport("send");
+      this.recvTransport = await this.createTransport("recv");
+      await this.flushPendingConsumes();
+
+      this.audioMuted = false;
+      this.videoEnabled = false;
+
+      // Privacy: never open the camera on join — only mic unless video is explicitly requested.
+      const micId = localStorage.getItem("molezinha.mic") || undefined;
+      const camId = localStorage.getItem("molezinha.cam") || undefined;
+      const constraints: MediaStreamConstraints = {};
+      if (opts.audio) {
+        constraints.audio = buildAudioConstraints(micId);
+      }
+      if (opts.video) constraints.video = buildVideoConstraints(camId);
+      if (!constraints.audio && !constraints.video) {
+        throw new Error("Nada para capturar na call");
+      }
+
+      const capture = await navigator.mediaDevices.getUserMedia(constraints);
+      const audioTracks: MediaStreamTrack[] = [];
+      if (opts.audio) {
+        const raw = capture.getAudioTracks()[0];
+        if (raw) {
+          const processed = await this.setupInputGain(raw);
+          audioTracks.push(processed);
+        }
+      }
+      const videoTracks = opts.video ? capture.getVideoTracks() : [];
+      // Stop unused capture tracks (e.g. video when audio-only)
+      if (!opts.video) {
+        for (const t of capture.getVideoTracks()) {
+          t.stop();
+        }
+      }
+      this.localStream = new MediaStream([...audioTracks, ...videoTracks]);
+
+      if (this.joinGeneration !== generation) {
+        this.teardownAudioPipeline();
+        this.localStream.getTracks().forEach((t) => t.stop());
+        this.localStream = null;
+        throw new Error("Entrada na call cancelada");
+      }
+
+      if (opts.audio) {
+        const track = this.localStream.getAudioTracks()[0];
+        this.audioProducer = await this.sendTransport.produce({
+          track,
+          appData: { source: "mic" },
+        });
+        if (opts.muteOnJoin) {
+          await this.audioProducer.pause();
+          track.enabled = false;
+          this.audioMuted = true;
+          this.send({ type: "mute", kind: "audio", muted: true });
+        }
+      }
+
+      if (opts.video) {
+        const track = this.localStream.getVideoTracks()[0];
+        if (track) {
+          this.videoProducer = await this.produceVideo(track, "camera");
+          this.videoEnabled = true;
+        }
+      }
+
+      for (const peer of joined.peers) {
+        if (peer.userId === opts.userId) continue;
+        for (const producer of peer.producers) {
+          await this.consumeProducer(
+            peer.peerId,
+            producer.id,
+            producer.kind,
+            producer.appData?.source ?? (producer.kind === "audio" ? "mic" : "camera")
+          );
+        }
+      }
+
+      this.emit();
+    };
+
+    const next = this.joinLock.then(run, run);
+    this.joinLock = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }
+
+  private async setupInputGain(raw: MediaStreamTrack): Promise<MediaStreamTrack> {
+    this.teardownAudioPipeline();
+    this.rawMicTrack = raw;
+    const settings = readVoiceSettings();
+    this.audioCtx = new AudioContext();
+    await this.audioCtx.resume().catch(() => undefined);
+    const source = this.audioCtx.createMediaStreamSource(new MediaStream([raw]));
+    this.inputGainNode = this.audioCtx.createGain();
+    this.inputGainNode.gain.value = settings.inputGain;
+    const dest = this.audioCtx.createMediaStreamDestination();
+    source.connect(this.inputGainNode);
+    this.inputGainNode.connect(dest);
+    const out = dest.stream.getAudioTracks()[0];
+    if (!out) throw new Error("Falha ao processar áudio de entrada");
+    return out;
+  }
+
+  private teardownAudioPipeline() {
+    try {
+      this.audioCtx?.close();
+    } catch {
+      /* ignore */
+    }
+    this.audioCtx = null;
+    this.inputGainNode = null;
+    if (this.rawMicTrack) {
+      try {
+        this.rawMicTrack.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.rawMicTrack = null;
+  }
+
+  async applyLiveVoiceSettings(settings: VoiceSettings = readVoiceSettings()) {
+    if (this.rawMicTrack) {
+      await applyVoiceProcessing(this.rawMicTrack, settings);
+    }
+    if (this.inputGainNode) {
+      this.inputGainNode.gain.value = settings.inputGain;
+    }
+    await this.applyVideoBitrate(this.videoProducer, "camera", settings);
+    await this.applyVideoBitrate(this.screenProducer, "screen", settings);
+  }
+
+  private async applyVideoBitrate(
+    producer: msTypes.Producer | null,
+    source: "camera" | "screen",
+    settings: VoiceSettings
+  ) {
+    if (!producer || producer.closed) return;
+    try {
+      await producer.setRtpEncodingParameters({
+        maxBitrate: videoBitrate(source, settings),
+      });
+    } catch (err) {
+      console.warn("[call] setRtpEncodingParameters failed", err);
+    }
+  }
+
+  private async produceVideo(track: MediaStreamTrack, source: "camera" | "screen") {
+    if (!this.sendTransport) throw new Error("Call ainda não está pronta");
+    return this.sendTransport.produce({
+      track,
+      encodings: [{ maxBitrate: videoBitrate(source) }],
+      codecOptions: { videoGoogleStartBitrate: 400 },
+      appData: { source },
+    });
+  }
+
+  private async createTransport(direction: "send" | "recv") {
+    const createdPromise = this.waitFor(
+      "transportCreated",
+      (m) => m.direction === direction
+    );
+    this.send({ type: "createWebRtcTransport", direction });
+    const created = await createdPromise;
+
+    const transport =
+      direction === "send"
+        ? this.device!.createSendTransport({
+            id: created.id,
+            iceParameters: created.iceParameters as msTypes.IceParameters,
+            iceCandidates: created.iceCandidates as msTypes.IceCandidate[],
+            dtlsParameters: created.dtlsParameters as msTypes.DtlsParameters,
+          })
+        : this.device!.createRecvTransport({
+            id: created.id,
+            iceParameters: created.iceParameters as msTypes.IceParameters,
+            iceCandidates: created.iceCandidates as msTypes.IceCandidate[],
+            dtlsParameters: created.dtlsParameters as msTypes.DtlsParameters,
+          });
+
+    transport.on("connect", ({ dtlsParameters }, callback, errback) => {
+      const connected = this.waitFor(
+        "transportConnected",
+        (m) => m.transportId === transport.id
+      );
+      this.send({
+        type: "connectWebRtcTransport",
+        transportId: transport.id,
+        dtlsParameters,
+      });
+      connected.then(() => callback()).catch(errback);
+    });
+
+    if (direction === "send") {
+      transport.on("produce", ({ kind, rtpParameters, appData }, callback, errback) => {
+        const source = (appData as { source?: MediaSource } | undefined)?.source;
+        // Camera and screen are both video — match the echoed source too.
+        // Servers that don't echo appData fall back to matching on kind alone.
+        const produced = this.waitFor(
+          "produced",
+          (m) => m.kind === kind && (m.appData?.source ?? source) === source
+        );
+        this.send({
+          type: "produce",
+          transportId: transport.id,
+          kind,
+          rtpParameters,
+          appData,
+        });
+        produced
+          .then((msg) => callback({ id: msg.id }))
+          .catch(errback);
+      });
+    }
+
+    return transport;
+  }
+
+  private async flushPendingConsumes() {
+    const pending = this.pendingConsumes.splice(0, this.pendingConsumes.length);
+    for (const item of pending) {
+      await this.consumeProducer(item.peerId, item.producerId, item.kind, item.source);
+    }
+  }
+
+  private async consumeProducer(
+    peerId: string,
+    producerId: string,
+    kind: "audio" | "video",
+    source: MediaSource
+  ) {
+    if (!this.recvTransport || !this.device) {
+      if (!this.pendingConsumes.some((p) => p.producerId === producerId)) {
+        this.pendingConsumes.push({ peerId, producerId, kind, source });
+      }
+      return;
+    }
+    if (this.consumedProducers.has(producerId) || this.localPeerIds.has(peerId)) return;
+
+    this.consumedProducers.add(producerId);
+    try {
+      const consumedPromise = this.waitFor(
+        "consumed",
+        (m) => m.producerId === producerId
+      );
+      this.send({
+        type: "consume",
+        transportId: this.recvTransport.id,
+        producerId,
+        rtpCapabilities: this.device.rtpCapabilities,
+      });
+      const consumed = await consumedPromise;
+
+      const consumer = await this.recvTransport.consume({
+        id: consumed.id,
+        producerId: consumed.producerId,
+        kind: consumed.kind,
+        rtpParameters: consumed.rtpParameters as msTypes.RtpParameters,
+      });
+
+      this.consumers.set(producerId, consumer);
+      this.send({ type: "resumeConsumer", consumerId: consumer.id });
+      try {
+        await consumer.resume();
+      } catch (err) {
+        console.warn("[call] consumer.resume failed", err);
+      }
+
+      // Trust the server echo — appData is authoritative for who owns the track.
+      const resolvedSource = consumed.appData?.source ?? source;
+      this.remoteSources.set(producerId, resolvedSource);
+
+      let peer = this.peers.get(peerId);
+      if (!peer) {
+        peer = {
+          peerId,
+          displayName: this.peerNames.get(peerId) ?? "Amigo",
+          stream: new MediaStream(),
+          screenStream: null,
+          audioMuted: false,
+          videoMuted: kind !== "audio",
+        };
+        this.peers.set(peerId, peer);
+      }
+      if (resolvedSource === "screen") {
+        if (!peer.screenStream) peer.screenStream = new MediaStream();
+        peer.screenStream.addTrack(consumer.track);
+        peer.screenStream = new MediaStream(peer.screenStream.getTracks());
+      } else {
+        peer.stream.addTrack(consumer.track);
+        if (kind === "video") peer.videoMuted = false;
+        // new stream identity for React consumers
+        peer.stream = new MediaStream(peer.stream.getTracks());
+      }
+      this.peers.set(peerId, { ...peer });
+      this.emit();
+    } catch (err) {
+      this.consumedProducers.delete(producerId);
+      this.consumers.delete(producerId);
+      console.warn("[call] consumeProducer failed", producerId, kind, err);
+    }
+  }
+
+  async setAudioMuted(muted: boolean) {
+    if (!this.audioProducer) {
+      this.audioMuted = muted;
+      this.emit();
+      return;
+    }
+    try {
+      if (muted) await this.audioProducer.pause();
+      else await this.audioProducer.resume();
+      const track = this.localStream?.getAudioTracks()[0];
+      if (track) track.enabled = !muted;
+      this.audioMuted = muted;
+      this.send({ type: "mute", kind: "audio", muted });
+      this.emit();
+    } catch (err) {
+      console.warn("[call] setAudioMuted failed", err);
+      throw err;
+    }
+  }
+
+  async setVideoEnabled(enabled: boolean) {
+    try {
+      if (!enabled) {
+        if (this.videoProducer && !this.videoProducer.closed) {
+          await this.videoProducer.pause();
+        }
+        const track = this.localStream?.getVideoTracks()[0];
+        if (track) {
+          track.enabled = false;
+          track.stop();
+          this.localStream?.removeTrack(track);
+          // new MediaStream so React/UI picks up the change
+          if (this.localStream) {
+            this.localStream = new MediaStream(this.localStream.getTracks());
+          }
+        }
+        if (this.videoProducer && !this.videoProducer.closed) {
+          const producerId = this.videoProducer.id;
+          this.videoProducer.close();
+          this.send({ type: "closeProducer", producerId });
+        }
+        this.videoProducer = null;
+        this.videoEnabled = false;
+        this.send({ type: "mute", kind: "video", muted: true });
+        this.emit();
+        return;
+      }
+
+      // enable camera
+      if (this.videoProducer && !this.videoProducer.closed) {
+        const existing = this.localStream?.getVideoTracks()[0];
+        if (existing && existing.readyState === "live") {
+          existing.enabled = true;
+          await this.videoProducer.resume();
+          this.videoEnabled = true;
+          this.send({ type: "mute", kind: "video", muted: false });
+          this.emit();
+          return;
+        }
+        this.videoProducer.close();
+        this.videoProducer = null;
+      }
+
+      if (!this.sendTransport) {
+        throw new Error("Call ainda não está pronta");
+      }
+
+      const camId = localStorage.getItem("molezinha.cam") || undefined;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: buildVideoConstraints(camId),
+      });
+      const videoTrack = stream.getVideoTracks()[0];
+      const audioTracks = this.localStream?.getAudioTracks() ?? [];
+      this.localStream = new MediaStream([...audioTracks, videoTrack]);
+      this.videoProducer = await this.produceVideo(videoTrack, "camera");
+      this.videoEnabled = true;
+      this.send({ type: "mute", kind: "video", muted: false });
+      this.emit();
+    } catch (err) {
+      this.videoEnabled = false;
+      this.emit();
+      console.warn("[call] setVideoEnabled failed", err);
+      throw err;
+    }
+  }
+
+  get screenSharing() {
+    return Boolean(this.screenProducer && !this.screenProducer.closed);
+  }
+
+  /** Capture a screen / window and publish it as a second video producer. */
+  async startScreenShare() {
+    if (this.screenSharing) return;
+    if (!this.sendTransport) throw new Error("Call ainda não está pronta");
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: buildScreenConstraints(),
+        audio: false,
+      });
+    } catch (err) {
+      // User cancelled the picker — not an error worth surfacing.
+      if (err instanceof DOMException && err.name === "NotAllowedError") return;
+      throw err;
+    }
+    const track = stream.getVideoTracks()[0];
+    if (!track) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error("Nenhuma tela selecionada");
+    }
+    // Prioritise sharpness over frame rate for text-heavy screens.
+    if ("contentHint" in track) track.contentHint = "detail";
+    // The OS "stop sharing" control ends the track outside our UI.
+    track.addEventListener("ended", () => {
+      void this.stopScreenShare();
+    });
+    this.screenStream = stream;
+    try {
+      this.screenProducer = await this.produceVideo(track, "screen");
+    } catch (err) {
+      stream.getTracks().forEach((t) => t.stop());
+      this.screenStream = null;
+      this.emit();
+      throw err;
+    }
+    this.emit();
+  }
+
+  async stopScreenShare() {
+    const producer = this.screenProducer;
+    this.screenProducer = null;
+    const stream = this.screenStream;
+    this.screenStream = null;
+    if (producer && !producer.closed) {
+      const producerId = producer.id;
+      try {
+        producer.close();
+      } catch {
+        /* ignore */
+      }
+      this.send({ type: "closeProducer", producerId });
+    }
+    stream?.getTracks().forEach((t) => {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    });
+    this.emit();
+  }
+
+  async leave() {
+    this.joinGeneration += 1;
+    await this.leaveInternal();
+  }
+
+  private async leaveInternal() {
+    this.clearPending();
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: "leave" }));
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.audioProducer?.close();
+    this.videoProducer?.close();
+    this.screenProducer?.close();
+    for (const consumer of this.consumers.values()) {
+      try {
+        consumer.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.consumers.clear();
+    this.consumedProducers.clear();
+    this.remoteSources.clear();
+    this.pendingConsumes = [];
+    this.sendTransport?.close();
+    this.recvTransport?.close();
+    this.localStream?.getTracks().forEach((t) => t.stop());
+    this.localStream = null;
+    this.screenStream?.getTracks().forEach((t) => t.stop());
+    this.screenStream = null;
+    this.teardownAudioPipeline();
+    this.audioProducer = null;
+    this.videoProducer = null;
+    this.screenProducer = null;
+    this.sendTransport = null;
+    this.recvTransport = null;
+    this.device = null;
+    this.peers.clear();
+    this.peerNames.clear();
+    this.channelId = null;
+    this.localUserId = null;
+    this.localPeerIds.clear();
+    this.audioMuted = false;
+    this.videoEnabled = false;
+    this.releaseMediaDevices();
+    this.emit();
+  }
+
+  /** Stop any lingering mic/cam tracks (e.g. after crash / HMR). Safe to call anytime. */
+  releaseMediaDevices() {
+    const stream = this.localStream;
+    this.localStream = null;
+    const screen = this.screenStream;
+    this.screenStream = null;
+    for (const s of [stream, screen]) {
+      s?.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      });
+    }
+    this.teardownAudioPipeline();
+    this.videoEnabled = false;
+    this.screenProducer = null;
+  }
+
+  get activeChannelId() {
+    return this.channelId;
+  }
+}
+
+export const callClient = new CallClient();

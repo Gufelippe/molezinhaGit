@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>molezinha</title>
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("molezinha.theme") || "dark";
+          var resolved =
+            theme === "system"
+              ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light"
+              : theme === "light"
+                ? "light"
+                : "dark";
+          document.documentElement.setAttribute("data-theme", resolved);
+          var raw = localStorage.getItem("molezinha.themeSettings");
+          if (!raw) return;
+          var s = JSON.parse(raw);
+          var map = {
+            bg: "--neo-bg",
+            bgDeep: "--neo-bg-deep",
+            bgElevated: "--neo-bg-elevated",
+            surface: "--neo-surface",
+            text: "--neo-text",
+            textMuted: "--neo-text-muted",
+            accent: "--neo-accent",
+            accentBright: "--neo-accent-bright",
+            accentSoft: "--neo-accent-soft",
+            danger: "--neo-danger",
+            dangerSoft: "--neo-danger-soft",
+            success: "--neo-success",
+            shadowLight: "--neo-shadow-light",
+            shadowDark: "--neo-shadow-dark",
+          };
+          var colors = s.colors || {};
+          Object.keys(colors).forEach(function (k) {
+            if (map[k] && colors[k]) document.documentElement.style.setProperty(map[k], colors[k]);
+          });
+          if (typeof s.radiusPx === "number") {
+            var base = Math.min(32, Math.max(8, s.radiusPx));
+            document.documentElement.style.setProperty("--neo-radius", base + "px");
+            document.documentElement.style.setProperty("--neo-radius-sm", Math.round(base * 0.64) + "px");
+            document.documentElement.style.setProperty("--neo-radius-xs", Math.round(base * 0.45) + "px");
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
