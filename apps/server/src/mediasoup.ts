@@ -3,6 +3,7 @@ import type {
   Worker,
   Router,
   WebRtcTransport,
+  PlainTransport,
   Producer,
   Consumer,
   DtlsParameters,
@@ -66,7 +67,7 @@ export interface PeerState {
   peerId: string;
   userId: string;
   displayName: string;
-  transports: Map<string, WebRtcTransport>;
+  transports: Map<string, WebRtcTransport | PlainTransport>;
   producers: Map<string, Producer>;
   consumers: Map<string, Consumer>;
   send: (msg: unknown) => void;
@@ -154,12 +155,24 @@ export function removePeerFromRoom(channelId: string, peerId: string) {
   room.peers.delete(peerId);
 
   for (const other of room.peers.values()) {
+    if (other.peerId.startsWith("music:")) continue;
     other.send({ type: "peerLeft", peerId });
   }
 
-  if (room.peers.size === 0) {
+  const humansLeft = [...room.peers.keys()].filter((id) => !id.startsWith("music:")).length;
+  if (humansLeft === 0) {
+    // Drop the music bot peer too and tear the room down.
+    for (const [id, leftover] of [...room.peers.entries()]) {
+      for (const producer of leftover.producers.values()) producer.close();
+      for (const transport of leftover.transports.values()) transport.close();
+      room.peers.delete(id);
+    }
     room.router.close();
     rooms.delete(channelId);
+    // Lazy import avoids a circular dependency with the music module.
+    void import("./music/queue.js")
+      .then((m) => m.stopChannel(channelId))
+      .catch(() => undefined);
   }
 }
 

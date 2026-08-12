@@ -5,6 +5,7 @@ import websocket from "@fastify/websocket";
 import { attachCallSocket } from "./signaling.js";
 import { attachSocialSocket } from "./social.js";
 import { getWorker } from "./mediasoup.js";
+import { registerMusicRoutes } from "./music/routes.js";
 
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? "0.0.0.0";
@@ -29,6 +30,8 @@ async function main() {
   app.get("/ws/social", { websocket: true }, (socket) => {
     attachSocialSocket(socket);
   });
+
+  await registerMusicRoutes(app);
 
   await app.listen({ port, host });
   console.log(`[molezinha-server] listening on ${host}:${port}`);

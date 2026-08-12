@@ -48,7 +48,7 @@ export async function verifySupabaseJwt(token: string): Promise<AuthUser> {
 export async function assertChannelMembership(
   userId: string,
   channelId: string
-): Promise<{ groupId: string; displayName: string }> {
+): Promise<{ groupId: string; displayName: string; role: "owner" | "admin" | "member" }> {
   const { data: channel, error: channelError } = await supabaseAdmin
     .from("channels")
     .select("id, group_id, type, is_private")
@@ -94,9 +94,12 @@ export async function assertChannelMembership(
     .eq("id", userId)
     .maybeSingle();
 
+  const role = (member.role as "owner" | "admin" | "member") ?? "member";
+
   return {
     groupId: channel.group_id,
     displayName: profile?.display_name ?? profile?.username ?? "Amigo",
+    role,
   };
 }
 

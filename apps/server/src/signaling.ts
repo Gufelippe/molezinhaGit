@@ -76,6 +76,7 @@ async function handleSignal(
 
     // One live session per user in a channel — drop ghost peers from reconnects
     for (const existing of [...room.peers.values()]) {
+      if (existing.peerId.startsWith("music:")) continue;
       if (existing.userId === auth.userId) {
         removePeerFromRoom(data.channelId, existing.peerId);
       }
@@ -115,8 +116,16 @@ async function handleSignal(
       routerRtpCapabilities: room.router.rtpCapabilities,
     });
 
+    try {
+      const { getMusicState } = await import("./music/queue.js");
+      send(socket, { type: "musicState", state: getMusicState(data.channelId) });
+    } catch {
+      /* music module optional at boot */
+    }
+
     for (const other of room.peers.values()) {
       if (other.peerId === ctx.peerId) continue;
+      if (other.peerId.startsWith("music:")) continue;
       other.send({
         type: "peerJoined",
         peer: {
@@ -167,14 +176,14 @@ async function handleSignal(
     }
     case "connectWebRtcTransport": {
       const transport = peer.transports.get(data.transportId);
-      if (!transport) throw new Error("Transport not found");
+      if (!transport || !("iceParameters" in transport)) throw new Error("Transport not found");
       await connectTransport(transport, data.dtlsParameters as DtlsParameters);
       send(socket, { type: "transportConnected", transportId: transport.id });
       return;
     }
     case "produce": {
       const transport = peer.transports.get(data.transportId);
-      if (!transport) throw new Error("Transport not found");
+      if (!transport || !("iceParameters" in transport)) throw new Error("Transport not found");
       const appData: MediaAppData = data.appData ?? {};
       const producer = await transport.produce({
         kind: data.kind,
@@ -190,6 +199,7 @@ async function handleSignal(
 
       for (const other of room.peers.values()) {
         if (other.peerId === peer.peerId) continue;
+        if (other.peerId.startsWith("music:")) continue;
         other.send({
           type: "newProducer",
           peerId: peer.peerId,
@@ -202,7 +212,7 @@ async function handleSignal(
     }
     case "consume": {
       const transport = peer.transports.get(data.transportId);
-      if (!transport) throw new Error("Transport not found");
+      if (!transport || !("iceParameters" in transport)) throw new Error("Transport not found");
       const consumer = await consumeOnTransport(
         room,
         transport,

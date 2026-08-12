@@ -18,6 +18,7 @@ import type {
 import { useAuth } from "./lib/auth";
 import { supabase } from "./lib/supabase";
 import { callClient } from "./lib/calls";
+import { musicApi } from "./lib/musicApi";
 import { socialClient } from "./lib/social";
 import {
   authorCache,
@@ -134,6 +135,11 @@ type DmRecent = {
   other: Profile;
 };
 
+type FriendRequest = {
+  id: string;
+  requester: Profile;
+};
+
 type ChannelUnread = { count: number; mentions: number; groupId: string };
 
 /** Accent bar that slides between the active channel/DM rows. */
@@ -190,6 +196,7 @@ export default function App() {
   const [joiningVoice, setJoiningVoice] = useState(false);
   const [promptKind, setPromptKind] = useState<"create" | "addFriend" | null>(null);
   const [friendIds, setFriendIds] = useState<Set<string>>(new Set());
+  const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
   const [dmRecents, setDmRecents] = useState<DmRecent[]>([]);
   const [dmUnread, setDmUnread] = useState<Map<string, number>>(() => new Map());
   const [channelUnread, setChannelUnread] = useState<Map<string, ChannelUnread>>(
@@ -281,6 +288,40 @@ export default function App() {
       ids.add(r.requester_id === user.id ? r.addressee_id : r.requester_id);
     }
     setFriendIds(ids);
+  }, [user]);
+
+  const loadFriendRequests = useCallback(async () => {
+    if (!user) return;
+    const { data } = await supabase
+      .from("friendships")
+      .select("id, requester_id, created_at")
+      .eq("status", "pending")
+      .eq("addressee_id", user.id)
+      .order("created_at", { ascending: false });
+
+    const rows = (data ?? []) as { id: string; requester_id: string }[];
+    if (!rows.length) {
+      setFriendRequests([]);
+      return;
+    }
+
+    const { data: profiles } = await supabase
+      .from("profiles")
+      .select(
+        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color"
+      )
+      .in(
+        "id",
+        rows.map((r) => r.requester_id)
+      );
+    const byId = new Map(((profiles ?? []) as Profile[]).map((p) => [p.id, p]));
+
+    setFriendRequests(
+      rows.flatMap((r) => {
+        const requester = byId.get(r.requester_id);
+        return requester ? [{ id: r.id, requester }] : [];
+      })
+    );
   }, [user]);
 
   const loadDmRecents = useCallback(async () => {
@@ -443,6 +484,7 @@ export default function App() {
     if (session) {
       void loadGroups();
       void loadFriends();
+      void loadFriendRequests();
       void loadDmRecents();
       void loadUnread();
       void loadSavedStickers();
@@ -453,6 +495,7 @@ export default function App() {
     session,
     loadGroups,
     loadFriends,
+    loadFriendRequests,
     loadDmRecents,
     loadUnread,
     loadSavedStickers,
@@ -460,18 +503,23 @@ export default function App() {
     loadBookmarkIds,
   ]);
 
+  // Realtime can drop while the app sleeps — resync on focus.
   useEffect(() => {
     if (!session) return;
-    const onFocus = () => void loadUnread();
+    const onFocus = () => {
+      void loadUnread();
+      void loadFriendRequests();
+      void loadFriends();
+    };
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };
-  }, [session, loadUnread]);
+  }, [session, loadUnread, loadFriendRequests, loadFriends]);
 
-  // Keep friendIds fresh for DM / profile actions
+  // Keep friendIds / pending requests fresh for DM / profile actions
   useEffect(() => {
     if (!user) return;
     const channel = supabase
@@ -481,6 +529,7 @@ export default function App() {
         { event: "*", schema: "public", table: "friendships" },
         () => {
           void loadFriends();
+          void loadFriendRequests();
           void loadDmRecents();
         }
       )
@@ -488,7 +537,7 @@ export default function App() {
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [user, loadFriends, loadDmRecents]);
+  }, [user, loadFriends, loadFriendRequests, loadDmRecents]);
 
   useEffect(() => {
     return () => {
@@ -2162,6 +2211,23 @@ export default function App() {
       return;
     }
     void loadFriends();
+    void loadFriendRequests();
+  }
+
+  async function respondFriendRequest(friendshipId: string, accept: boolean) {
+    setError(null);
+    const { error: err } = await supabase.rpc("respond_friend_request", {
+      p_friendship_id: friendshipId,
+      p_accept: accept,
+    });
+    if (err) {
+      setError(err.message);
+      void loadFriendRequests();
+      return;
+    }
+    setFriendRequests((prev) => prev.filter((r) => r.id !== friendshipId));
+    void loadFriends();
+    if (accept) void loadDmRecents();
   }
 
   async function joinVoice(channel: Channel) {
@@ -2508,6 +2574,19 @@ export default function App() {
                   <IconFriends />
                   Adicionar amigo
                 </button>
+                {friendRequests.length > 0 && (
+                  <button
+                    type="button"
+                    className={`channel-item ${view.kind === "home" ? "active" : ""}`}
+                    onClick={goHome}
+                  >
+                    <IconFriends />
+                    <span className="channel-item-name">Pedidos de amizade</span>
+                    <span className="unread-badge mention">
+                      {formatBadgeCount(friendRequests.length)}
+                    </span>
+                  </button>
+                )}
                 <button
                   type="button"
                   className={`channel-item ${bookmarksOpen ? "active" : ""}`}
@@ -2668,7 +2747,10 @@ export default function App() {
           {inVoice && voiceChannel && (
             <div className={inActiveVoiceView ? "call-stage" : "call-stage call-stage-compact"}>
               <CallBar
+                channelId={voiceChannel.id}
                 channelName={voiceChannel.name}
+                userId={user?.id ?? ""}
+                isStaff={isStaff}
                 onLeave={() => {
                   void callClient.leave();
                   setInVoice(false);
@@ -2740,6 +2822,19 @@ export default function App() {
                       ? (pollId, optionId) => void votePoll(pollId, optionId)
                       : undefined
                   }
+                  onPlayYoutube={
+                    view.kind === "channel" &&
+                    inVoice &&
+                    voiceChannel?.id === view.channel.id
+                      ? (url) => {
+                          void musicApi.play(view.channel.id, url).catch((err) => {
+                            setError(
+                              err instanceof Error ? err.message : "Não foi possível tocar na call"
+                            );
+                          });
+                        }
+                      : undefined
+                  }
                 />
                 )}
                 {view.kind === "channel" && (
@@ -2797,6 +2892,46 @@ export default function App() {
                   Escolha uma conversa à esquerda ou adicione alguém pelo botão Adicionar amigo.
                 </p>
               </div>
+              {friendRequests.length > 0 && (
+                <section className="home-requests">
+                  <div className="section-label">
+                    Pedidos de amizade — {friendRequests.length}
+                  </div>
+                  {friendRequests.map((req) => (
+                    <div key={req.id} className="home-request-row">
+                      <Avatar
+                        size="md"
+                        name={req.requester.display_name}
+                        url={req.requester.avatar_url}
+                        id={req.requester.id}
+                        status={req.requester.status}
+                      />
+                      <div className="user-panel-identity">
+                        <span className="user-panel-name">{req.requester.display_name}</span>
+                        <span className="user-panel-handle muted">
+                          @{req.requester.username}
+                        </span>
+                      </div>
+                      <div className="stack-row home-request-actions">
+                        <button
+                          type="button"
+                          className="neo-btn neo-btn-primary neo-btn-compact"
+                          onClick={() => void respondFriendRequest(req.id, true)}
+                        >
+                          Aceitar
+                        </button>
+                        <button
+                          type="button"
+                          className="neo-btn neo-btn-danger neo-btn-compact"
+                          onClick={() => void respondFriendRequest(req.id, false)}
+                        >
+                          Recusar
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </section>
+              )}
               {dmRecents.length === 0 ? (
                 <EmptyState
                   art="dms"

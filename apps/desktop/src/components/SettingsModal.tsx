@@ -15,6 +15,7 @@ import {
   restoreCustomAppearance,
 } from "../lib/theme";
 import { MEDIA_LIMITS, validateImageFile } from "../lib/mediaLimits";
+import { ImageCropModal } from "./ImageCropModal";
 import {
   IconBell,
   IconClose,
@@ -130,8 +131,25 @@ async function uploadImage(bucket: "avatars" | "banners", userId: string, file: 
   await clearUserStorageFolder(bucket, userId);
   const path = `${userId}/${Date.now()}-${file.name.replace(/[^\w.\-]+/g, "_")}`;
   const { error } = await supabase.storage.from(bucket).upload(path, file, { upsert: true });
-  if (error) throw new Error(error.message);
+  if (error) {
+    // Storage answers RLS failures with a bare Postgres message — translate it.
+    if (/row-level security|violates|not authorized/i.test(error.message)) {
+      throw new Error(
+        `O Storage recusou o upload de ${kind === "avatar" ? "avatar" : "banner"}. Rode a migration mais recente de storage no Supabase.`
+      );
+    }
+    throw new Error(error.message);
+  }
   return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+}
+
+/** The cropper re-encodes everything, so the source only needs a sanity cap. */
+const MAX_SOURCE_BYTES = 25 * 1024 * 1024;
+
+function validateSource(file: File): string | null {
+  if (!file.type.startsWith("image/")) return "Envie uma imagem (PNG, JPG, WEBP ou GIF).";
+  if (file.size > MAX_SOURCE_BYTES) return "Imagem muito grande (máx. 25MB).";
+  return null;
 }
 
 function validateImage(file: File, kind: "avatar" | "banner" = "avatar"): string | null {
@@ -190,6 +208,9 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
   const [pendingBanner, setPendingBanner] = useState<File | null>(null);
   const [pendingBannerPreview, setPendingBannerPreview] = useState<string | null>(null);
   const [removeBanner, setRemoveBanner] = useState(false);
+  const [cropSource, setCropSource] = useState<{ kind: "avatar" | "banner"; file: File } | null>(
+    null
+  );
   const avatarRef = useRef<HTMLInputElement>(null);
   const bannerRef = useRef<HTMLInputElement>(null);
 
@@ -312,6 +333,13 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
   }, []);
 
   if (!open) return null;
+
+  function openCropper(kind: "avatar" | "banner", file: File) {
+    const err = validateSource(file);
+    setStatus(err);
+    if (err) return;
+    setCropSource({ kind, file });
+  }
 
   function stageAvatar(file: File) {
     setStatus(null);
@@ -639,7 +667,7 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
                 hidden
                 onChange={(e) => {
                   const file = e.target.files?.[0];
-                  if (file) stageAvatar(file);
+                  if (file) openCropper("avatar", file);
                   e.target.value = "";
                 }}
               />
@@ -650,7 +678,7 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
                 hidden
                 onChange={(e) => {
                   const file = e.target.files?.[0];
-                  if (file) stageBanner(file);
+                  if (file) openCropper("banner", file);
                   e.target.value = "";
                 }}
               />
@@ -1180,6 +1208,18 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
           </div>
         )}
       </section>
+
+      <ImageCropModal
+        open={!!cropSource}
+        file={cropSource?.file ?? null}
+        kind={cropSource?.kind ?? "avatar"}
+        onCancel={() => setCropSource(null)}
+        onConfirm={(file) => {
+          if (cropSource?.kind === "banner") stageBanner(file);
+          else stageAvatar(file);
+          setCropSource(null);
+        }}
+      />
     </div>
   );
 }

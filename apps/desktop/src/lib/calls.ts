@@ -1,5 +1,5 @@
 import type { types as msTypes } from "mediasoup-client";
-import type { CallServerMessage, MediaSource } from "@molezinha/shared";
+import type { CallServerMessage, MediaSource, MusicChannelState } from "@molezinha/shared";
 import { CALLS_URL } from "./supabase";
 import {
   applyVoiceProcessing,
@@ -38,6 +38,12 @@ type Listener = (
   media: MediaState
 ) => void;
 
+type MusicListener = (state: MusicChannelState | null) => void;
+
+export function isMusicPeerId(peerId: string) {
+  return peerId.startsWith("music:");
+}
+
 export class CallClient {
   private ws: WebSocket | null = null;
   private device: MsDevice | null = null;
@@ -52,6 +58,9 @@ export class CallClient {
   private peerNames = new Map<string, string>();
   private pending = new Map<string, (msg: CallServerMessage) => void>();
   private listeners = new Set<Listener>();
+  private musicListeners = new Set<MusicListener>();
+  private musicState: MusicChannelState | null = null;
+  private musicVolume = 0.8;
   private channelId: string | null = null;
   private localUserId: string | null = null;
   private localPeerIds = new Set<string>();
@@ -73,6 +82,11 @@ export class CallClient {
   private audioCtx: AudioContext | null = null;
   private inputGainNode: GainNode | null = null;
   private rawMicTrack: MediaStreamTrack | null = null;
+  /** Processing flags the live mic capture was opened with. */
+  private appliedProcessing: Pick<
+    VoiceSettings,
+    "noiseSuppression" | "echoCancellation" | "autoGainControl"
+  > | null = null;
   private unsubVoiceSettings: (() => void) | null = null;
 
   constructor() {
@@ -88,6 +102,38 @@ export class CallClient {
     return () => {
       this.listeners.delete(fn);
     };
+  }
+
+  onMusicState(fn: MusicListener) {
+    this.musicListeners.add(fn);
+    fn(this.musicState);
+    return () => {
+      this.musicListeners.delete(fn);
+    };
+  }
+
+  getMusicState() {
+    return this.musicState;
+  }
+
+  getMusicVolume() {
+    return this.musicVolume;
+  }
+
+  setMusicVolume(volume: number) {
+    this.musicVolume = Math.min(1, Math.max(0, volume));
+    this.applyMusicVolume();
+  }
+
+  private applyMusicVolume() {
+    const nodes = document.querySelectorAll<HTMLAudioElement>("audio.call-music-audio");
+    for (const el of nodes) {
+      el.volume = this.musicVolume;
+    }
+  }
+
+  private emitMusic() {
+    for (const fn of this.musicListeners) fn(this.musicState);
   }
 
   getPeersSnapshot() {
@@ -239,6 +285,13 @@ export class CallClient {
       if (msg.kind === "audio") peer.audioMuted = msg.muted;
       if (msg.kind === "video") peer.videoMuted = msg.muted;
       this.emit();
+      return;
+    }
+
+    if (msg.type === "musicState") {
+      this.musicState = msg.state;
+      this.emitMusic();
+      queueMicrotask(() => this.applyMusicVolume());
     }
   }
 
@@ -432,10 +485,19 @@ export class CallClient {
     return next;
   }
 
-  private async setupInputGain(raw: MediaStreamTrack): Promise<MediaStreamTrack> {
+  private async setupInputGain(
+    raw: MediaStreamTrack,
+    settings: VoiceSettings = readVoiceSettings()
+  ): Promise<MediaStreamTrack> {
     this.teardownAudioPipeline();
     this.rawMicTrack = raw;
-    const settings = readVoiceSettings();
+    this.appliedProcessing = {
+      noiseSuppression: settings.noiseSuppression,
+      echoCancellation: settings.echoCancellation,
+      autoGainControl: settings.autoGainControl,
+    };
+    // Web Audio only earns its latency when the gain is actually changed.
+    if (settings.inputGain === 1) return raw;
     this.audioCtx = new AudioContext();
     await this.audioCtx.resume().catch(() => undefined);
     const source = this.audioCtx.createMediaStreamSource(new MediaStream([raw]));
@@ -457,6 +519,7 @@ export class CallClient {
     }
     this.audioCtx = null;
     this.inputGainNode = null;
+    this.appliedProcessing = null;
     if (this.rawMicTrack) {
       try {
         this.rawMicTrack.stop();
@@ -468,14 +531,73 @@ export class CallClient {
   }
 
   async applyLiveVoiceSettings(settings: VoiceSettings = readVoiceSettings()) {
-    if (this.rawMicTrack) {
-      await applyVoiceProcessing(this.rawMicTrack, settings);
-    }
-    if (this.inputGainNode) {
+    const applied = this.appliedProcessing;
+    const processingChanged =
+      !applied ||
+      applied.noiseSuppression !== settings.noiseSuppression ||
+      applied.echoCancellation !== settings.echoCancellation ||
+      applied.autoGainControl !== settings.autoGainControl;
+    // The gain node is added on demand; once it exists it stays, so dragging the
+    // slider back through 1 doesn't re-open the mic.
+    const needsGainNode = settings.inputGain !== 1 && !this.inputGainNode;
+
+    if (this.rawMicTrack && (processingChanged || needsGainNode)) {
+      await this.restartMicTrack(settings);
+    } else if (this.inputGainNode) {
       this.inputGainNode.gain.value = settings.inputGain;
     }
+
     await this.applyVideoBitrate(this.videoProducer, "camera", settings);
     await this.applyVideoBitrate(this.screenProducer, "screen", settings);
+  }
+
+  /**
+   * Chromium locks noise suppression / echo cancellation / AGC at capture time —
+   * `applyConstraints` on a live track is a no-op, so re-capture and swap the track.
+   */
+  private async restartMicTrack(settings: VoiceSettings) {
+    const producer = this.audioProducer;
+    const micId = localStorage.getItem("molezinha.mic") || undefined;
+
+    let capture: MediaStream;
+    try {
+      capture = await navigator.mediaDevices.getUserMedia({
+        audio: buildAudioConstraints(micId, settings),
+      });
+    } catch (err) {
+      console.warn("[call] mic re-capture failed", err);
+      // Keep the current track alive and at least try the (best effort) live update.
+      if (this.rawMicTrack) await applyVoiceProcessing(this.rawMicTrack, settings);
+      return;
+    }
+
+    const raw = capture.getAudioTracks()[0];
+    if (!raw) return;
+
+    const previousAudio = this.localStream?.getAudioTracks() ?? [];
+    const outgoing = await this.setupInputGain(raw, settings);
+    outgoing.enabled = !this.audioMuted;
+
+    if (producer && !producer.closed) {
+      try {
+        await producer.replaceTrack({ track: outgoing });
+      } catch (err) {
+        console.warn("[call] replaceTrack failed", err);
+      }
+    }
+
+    for (const old of previousAudio) {
+      if (old === outgoing) continue;
+      try {
+        old.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const otherTracks = this.localStream?.getTracks().filter((t) => t.kind !== "audio") ?? [];
+    this.localStream = new MediaStream([outgoing, ...otherTracks]);
+    this.emit();
   }
 
   private async applyVideoBitrate(
@@ -615,7 +737,23 @@ export class CallClient {
       }
 
       // Trust the server echo — appData is authoritative for who owns the track.
-      const resolvedSource = consumed.appData?.source ?? source;
+      let resolvedSource = consumed.appData?.source ?? source;
+
+      // Older clients publish without appData. A peer only ever has one camera,
+      // so a second live video track can only be a screen share.
+      if (kind === "video" && resolvedSource !== "screen") {
+        const existing = this.peers.get(peerId);
+        const hasCamera = existing?.stream
+          .getVideoTracks()
+          .some((t) => t.readyState === "live");
+        if (hasCamera) resolvedSource = "screen";
+      }
+      if (!consumed.appData?.source) {
+        console.warn(
+          "[call] producer without appData.source — peer or server is outdated",
+          { peerId, kind, assumed: resolvedSource }
+        );
+      }
       this.remoteSources.set(producerId, resolvedSource);
 
       let peer = this.peers.get(peerId);
@@ -858,6 +996,8 @@ export class CallClient {
     this.localPeerIds.clear();
     this.audioMuted = false;
     this.videoEnabled = false;
+    this.musicState = null;
+    this.emitMusic();
     this.releaseMediaDevices();
     this.emit();
   }

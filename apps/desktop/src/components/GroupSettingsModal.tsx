@@ -6,6 +6,7 @@ import { formatChatTime } from "../lib/datetime";
 import { Avatar } from "./Avatar";
 import { IconClose, IconHash, IconMegaphone, IconSpeaker } from "./Icons";
 import { PromptModal } from "./PromptModal";
+import { ImageCropModal } from "./ImageCropModal";
 import { NeoCheck, NeoToggle } from "./NeoControls";
 import { NeoColorField } from "./NeoColorField";
 
@@ -83,6 +84,10 @@ export function GroupSettingsModal({
   const [localWallpaper, setLocalWallpaper] = useState<string | null>(wallpaperUrl);
   const [localAccent, setLocalAccent] = useState(accentColor);
   const [maxUses, setMaxUses] = useState(inviteMaxUses ? String(inviteMaxUses) : "");
+  const [cropSource, setCropSource] = useState<{
+    kind: "groupIcon" | "groupWallpaper";
+    file: File;
+  } | null>(null);
 
   const isOwner = myRole === "owner";
   const isStaff = myRole === "owner" || myRole === "admin";
@@ -296,6 +301,19 @@ export function GroupSettingsModal({
     }
     onBrandingChanged?.(patch);
     return true;
+  }
+
+  function pickBrandingAsset(file: File, kind: "groupIcon" | "groupWallpaper") {
+    if (!file.type.startsWith("image/")) {
+      setStatus("Envie uma imagem (PNG, JPG, WEBP ou GIF).");
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      setStatus("Imagem muito grande (máx. 25MB).");
+      return;
+    }
+    setStatus(null);
+    setCropSource({ kind, file });
   }
 
   async function uploadBrandingAsset(file: File, kind: "groupIcon" | "groupWallpaper") {
@@ -536,7 +554,7 @@ export function GroupSettingsModal({
                           onChange={(e) => {
                             const file = e.target.files?.[0];
                             e.target.value = "";
-                            if (file) void uploadBrandingAsset(file, "groupIcon");
+                            if (file) pickBrandingAsset(file, "groupIcon");
                           }}
                         />
                       </label>
@@ -587,7 +605,7 @@ export function GroupSettingsModal({
                           onChange={(e) => {
                             const file = e.target.files?.[0];
                             e.target.value = "";
-                            if (file) void uploadBrandingAsset(file, "groupWallpaper");
+                            if (file) pickBrandingAsset(file, "groupWallpaper");
                           }}
                         />
                       </label>
@@ -855,6 +873,17 @@ export function GroupSettingsModal({
         confirmLabel="Criar"
         onClose={() => setChannelPrompt(null)}
         onConfirm={(name) => void createChannel(name, "announcement")}
+      />
+      <ImageCropModal
+        open={!!cropSource}
+        file={cropSource?.file ?? null}
+        kind={cropSource?.kind ?? "groupIcon"}
+        onCancel={() => setCropSource(null)}
+        onConfirm={(file) => {
+          const kind = cropSource?.kind ?? "groupIcon";
+          setCropSource(null);
+          void uploadBrandingAsset(file, kind);
+        }}
       />
     </>
   );

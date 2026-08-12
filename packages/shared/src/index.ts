@@ -344,10 +344,11 @@ export type CallServerMessage =
     }
   | { type: "producerClosed"; peerId: string; producerId: string }
   | { type: "peerMute"; peerId: string; kind: "audio" | "video"; muted: boolean }
+  | { type: "musicState"; state: MusicChannelState }
   | { type: "error"; message: string };
 
 /** Which capture a producer came from — lets peers tell a webcam from a shared screen. */
-export type MediaSource = "mic" | "camera" | "screen";
+export type MediaSource = "mic" | "camera" | "screen" | "music";
 
 export type MediaAppData = { source?: MediaSource } & Record<string, unknown>;
 
@@ -357,3 +358,19 @@ export interface CallPeerInfo {
   displayName: string;
   producers: { id: string; kind: "audio" | "video"; appData?: MediaAppData }[];
 }
+
+/** One queued or playing track for the voice-channel music bot. */
+export type MusicTrack = {
+  trackId: string;
+  url: string;
+  title: string;
+  requestedBy: string;
+  requestedByName: string;
+  thumbnail?: string | null;
+};
+
+export type MusicChannelState = {
+  channelId: string;
+  nowPlaying: MusicTrack | null;
+  queue: MusicTrack[];
+};

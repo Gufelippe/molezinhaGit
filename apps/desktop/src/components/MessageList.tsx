@@ -2,12 +2,14 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { Message, MessageAttachment, MessagePollAgg } from "@molezinha/shared";
 import { parseMentionTokens } from "../lib/notifications";
 import { formatChatTime, formatFullTime } from "../lib/datetime";
+import { extractYoutubeUrl } from "../lib/musicApi";
 import { Avatar } from "./Avatar";
 import { EmptyState, type EmptyArt } from "./EmptyState";
 import { NeoTooltip } from "./NeoTooltip";
 import {
   IconBookmark,
   IconClose,
+  IconMusic,
   IconPaperclip,
   IconPin,
   IconPoll,
@@ -166,6 +168,7 @@ function MessageRow({
   onToggleReaction,
   onVotePoll,
   onOpenImage,
+  onPlayYoutube,
 }: {
   message: Message;
   grouped: boolean;
@@ -180,6 +183,7 @@ function MessageRow({
   onToggleReaction: (message: Message, emoji: string) => void;
   onVotePoll?: (pollId: string, optionId: string) => void;
   onOpenImage: (att: MessageAttachment) => void;
+  onPlayYoutube?: (url: string) => void;
 }) {
   const st = Array.isArray(message.stickers) ? message.stickers[0] : message.stickers;
   const stickerUrl = message.sticker_id && st?.file_url ? st.file_url : null;
@@ -199,6 +203,7 @@ function MessageRow({
   const attachmentOnly = attachments.length > 0 && message.content.trim() === "📎";
   // The poll card already shows the question — the message text is only a fallback for previews.
   const pollOnly = Boolean(message.poll);
+  const youtubeUrl = !pollOnly && !attachmentOnly && !stickerUrl ? extractYoutubeUrl(plainText) : null;
 
   return (
     <div
@@ -287,6 +292,16 @@ function MessageRow({
               <MessageBody content={message.content} myUsername={myUsername} />
             )}
           </div>
+        )}
+        {youtubeUrl && onPlayYoutube && (
+          <button
+            type="button"
+            className="msg-play-yt"
+            onClick={() => onPlayYoutube(youtubeUrl)}
+          >
+            <IconMusic />
+            Tocar na call
+          </button>
         )}
         {attachments.length > 0 && (
           <AttachmentGrid attachments={attachments} onOpenImage={onOpenImage} />
@@ -401,6 +416,7 @@ interface Props {
   onContextAction: (message: Message, action: ContextMenuAction) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onVotePoll?: (pollId: string, optionId: string) => void;
+  onPlayYoutube?: (url: string) => void;
 }
 
 function UnreadDivider({ at }: { at: string }) {
@@ -465,6 +481,7 @@ export const MessageList = memo(function MessageList({
   onContextAction,
   onToggleReaction,
   onVotePoll,
+  onPlayYoutube,
 }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
@@ -555,6 +572,7 @@ export const MessageList = memo(function MessageList({
               onToggleReaction={onToggleReaction}
               onVotePoll={onVotePoll}
               onOpenImage={openImage}
+              onPlayYoutube={onPlayYoutube}
             />
           </div>
         );

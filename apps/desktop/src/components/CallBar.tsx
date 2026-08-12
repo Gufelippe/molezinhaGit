@@ -1,17 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import { callClient, type RemotePeerMedia } from "../lib/calls";
+import type { MusicChannelState } from "@molezinha/shared";
+import { callClient, isMusicPeerId, type RemotePeerMedia } from "../lib/calls";
 import { onVoiceSettingsChange, readVoiceSettings, applyAudioOutput } from "../lib/voiceSettings";
 import {
   IconMic,
   IconMicOff,
+  IconMusic,
   IconPhoneOff,
   IconScreen,
   IconVideo,
   IconVideoOff,
 } from "./Icons";
+import { MusicPanel } from "./MusicPanel";
 
 interface Props {
+  channelId: string;
   channelName: string;
+  userId: string;
+  isStaff: boolean;
   onLeave: () => void;
 }
 
@@ -22,11 +28,12 @@ function getOutputVolume() {
 /** WebView2 often blocks autoplay until a click — re-kick all remote <audio>. */
 function kickRemoteAudioPlayback() {
   const settings = readVoiceSettings();
+  const musicVolume = callClient.getMusicVolume();
   const nodes = document.querySelectorAll<HTMLAudioElement>(".call-ui audio.call-remote-audio");
   for (const el of nodes) {
     if (!el.srcObject) continue;
     el.muted = false;
-    el.volume = settings.outputVolume;
+    el.volume = el.classList.contains("call-music-audio") ? musicVolume : settings.outputVolume;
     void applyAudioOutput(el, settings.outputDeviceId);
     void el.play().catch((err) => console.warn("[call] remote audio play failed", err));
   }
@@ -36,7 +43,7 @@ function initialOf(name: string) {
   return (name || "?")[0]?.toUpperCase() ?? "?";
 }
 
-export function CallBar({ channelName, onLeave }: Props) {
+export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Props) {
   const initial = callClient.getMediaState();
   const [muted, setMuted] = useState(initial.audioMuted);
   const [videoOn, setVideoOn] = useState(initial.videoEnabled);
@@ -46,8 +53,13 @@ export function CallBar({ channelName, onLeave }: Props) {
   const [peers, setPeers] = useState<Map<string, RemotePeerMedia>>(() => callClient.getPeersSnapshot());
   const [localStream, setLocalStream] = useState<MediaStream | null>(() => callClient.getLocalStream());
   const [status, setStatus] = useState<string | null>(null);
+  const [musicState, setMusicState] = useState<MusicChannelState | null>(() =>
+    callClient.getMusicState()
+  );
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const localScreenRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => callClient.onMusicState(setMusicState), []);
 
   useEffect(() => {
     const unsub = callClient.onUpdate((nextPeers, local, media) => {
@@ -138,6 +150,11 @@ export function CallBar({ channelName, onLeave }: Props) {
   }
 
   const peerList = [...peers.values()];
+  const humanPeers = peerList.filter((p) => !isMusicPeerId(p.peerId));
+  const musicPeers = peerList.filter((p) => isMusicPeerId(p.peerId));
+  const screenPeers = humanPeers.filter((p) => p.screenStream);
+  // A shared screen takes the stage; cameras drop to a strip so no tile is starved.
+  const hasStage = sharing || screenPeers.length > 0;
 
   return (
     <div
@@ -147,35 +164,43 @@ export function CallBar({ channelName, onLeave }: Props) {
       }}
     >
       <div className="call-stage-row">
-        <div className="video-grid">
-          <div className={`video-tile ${videoOn ? "" : "video-tile-off"}`}>
-            {videoOn ? (
-              <video ref={localVideoRef} autoPlay muted playsInline />
-            ) : (
-              <div className="video-tile-placeholder">Câmera off</div>
-            )}
-            <span className="label">
-              Você{muted ? " · mudo" : ""}
-            </span>
-          </div>
-          {sharing && (
-            <div className="video-tile video-tile-screen">
-              <video ref={localScreenRef} autoPlay muted playsInline />
-              <span className="label">Sua tela</span>
+        <div className="call-media">
+          {hasStage && (
+            <div className="screen-stage">
+              {sharing && (
+                <div className="video-tile video-tile-screen">
+                  <video ref={localScreenRef} autoPlay muted playsInline />
+                  <span className="label">Sua tela</span>
+                </div>
+              )}
+              {screenPeers.map((peer) => (
+                <RemoteScreenTile key={`${peer.peerId}:screen`} peer={peer} />
+              ))}
             </div>
           )}
-          {peerList.map((peer) => (
-            <RemoteTile key={peer.peerId} peer={peer} />
-          ))}
-          {peerList
-            .filter((peer) => peer.screenStream)
-            .map((peer) => (
-              <RemoteScreenTile key={`${peer.peerId}:screen`} peer={peer} />
+          <div className={`video-grid ${hasStage ? "video-grid-strip" : ""}`}>
+            <div className={`video-tile ${videoOn ? "" : "video-tile-off"}`}>
+              {videoOn ? (
+                <video ref={localVideoRef} autoPlay muted playsInline />
+              ) : (
+                <div className="video-tile-placeholder">Câmera off</div>
+              )}
+              <span className="label">
+                Você{muted ? " · mudo" : ""}
+              </span>
+            </div>
+            {humanPeers.map((peer) => (
+              <RemoteTile key={peer.peerId} peer={peer} />
             ))}
+            {/* Music bot is audio-only — keep a hidden player, no video tile. */}
+            {musicPeers.map((peer) => (
+              <MusicAudio key={peer.peerId} peer={peer} />
+            ))}
+          </div>
         </div>
 
         <aside className="call-roster" aria-label="Quem está na call">
-          <div className="call-roster-title">Na call — {peerList.length + 1}</div>
+          <div className="call-roster-title">Na call — {humanPeers.length + 1}</div>
           <div className="call-roster-list">
             <div className="call-roster-row">
               <div className="call-roster-avatar">Vc</div>
@@ -186,7 +211,7 @@ export function CallBar({ channelName, onLeave }: Props) {
                 {sharing && <IconScreen className="icon call-roster-flag live" />}
               </span>
             </div>
-            {peerList.map((peer) => (
+            {humanPeers.map((peer) => (
               <div className="call-roster-row" key={peer.peerId}>
                 <div className="call-roster-avatar">{initialOf(peer.displayName)}</div>
                 <span className="call-roster-name">{peer.displayName}</span>
@@ -197,7 +222,21 @@ export function CallBar({ channelName, onLeave }: Props) {
                 </span>
               </div>
             ))}
+            {musicPeers.map((peer) => (
+              <div className="call-roster-row" key={peer.peerId}>
+                <div className="call-roster-avatar call-roster-avatar-music">
+                  <IconMusic />
+                </div>
+                <span className="call-roster-name">
+                  {musicState?.nowPlaying?.title || peer.displayName}
+                </span>
+                <span className="call-roster-flags">
+                  <IconMusic className="icon call-roster-flag live" />
+                </span>
+              </div>
+            ))}
           </div>
+          <MusicPanel channelId={channelId} userId={userId} isStaff={isStaff} />
         </aside>
       </div>
 
@@ -252,6 +291,44 @@ export function CallBar({ channelName, onLeave }: Props) {
         </div>
       </div>
     </div>
+  );
+}
+
+function MusicAudio({ peer }: { peer: RemotePeerMedia }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const liveAudioTracks = peer.stream.getAudioTracks().filter((t) => t.readyState === "live");
+  const audioTrackIds = liveAudioTracks.map((t) => t.id).join(",");
+
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (liveAudioTracks.length > 0) {
+      el.srcObject = new MediaStream(liveAudioTracks);
+      el.muted = false;
+      el.volume = callClient.getMusicVolume();
+      void applyAudioOutput(el);
+      void el.play().catch((err) => console.warn("[call] music audio play failed", err));
+    } else {
+      el.srcObject = null;
+    }
+  }, [peer.stream, audioTrackIds]);
+
+  useEffect(() => {
+    return onVoiceSettingsChange((s) => {
+      const el = audioRef.current;
+      if (!el) return;
+      void applyAudioOutput(el, s.outputDeviceId);
+    });
+  }, []);
+
+  return (
+    <audio
+      ref={audioRef}
+      className="call-remote-audio call-music-audio"
+      autoPlay
+      playsInline
+      aria-hidden
+    />
   );
 }
 
