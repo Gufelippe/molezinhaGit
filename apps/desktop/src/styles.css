@@ -3073,7 +3073,9 @@ h3,
   padding: 0.25rem 0;
 }
 
-.home-requests {
+.home-requests,
+.home-friends,
+.home-dm-section {
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
