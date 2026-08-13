@@ -196,6 +196,7 @@ export default function App() {
   const [joiningVoice, setJoiningVoice] = useState(false);
   const [promptKind, setPromptKind] = useState<"create" | "addFriend" | null>(null);
   const [friendIds, setFriendIds] = useState<Set<string>>(new Set());
+  const [friends, setFriends] = useState<Profile[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
   const [dmRecents, setDmRecents] = useState<DmRecent[]>([]);
   const [dmUnread, setDmUnread] = useState<Map<string, number>>(() => new Map());
@@ -288,6 +289,20 @@ export default function App() {
       ids.add(r.requester_id === user.id ? r.addressee_id : r.requester_id);
     }
     setFriendIds(ids);
+    if (!ids.size) {
+      setFriends([]);
+      return;
+    }
+    const { data: profiles } = await supabase
+      .from("profiles")
+      .select(
+        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color"
+      )
+      .in("id", [...ids]);
+    const list = ((profiles ?? []) as Profile[]).slice().sort((a, b) =>
+      a.display_name.localeCompare(b.display_name, "pt", { sensitivity: "base" })
+    );
+    setFriends(list);
   }, [user]);
 
   const loadFriendRequests = useCallback(async () => {
@@ -2216,6 +2231,7 @@ export default function App() {
 
   async function respondFriendRequest(friendshipId: string, accept: boolean) {
     setError(null);
+    const request = friendRequests.find((r) => r.id === friendshipId);
     const { error: err } = await supabase.rpc("respond_friend_request", {
       p_friendship_id: friendshipId,
       p_accept: accept,
@@ -2227,7 +2243,12 @@ export default function App() {
     }
     setFriendRequests((prev) => prev.filter((r) => r.id !== friendshipId));
     void loadFriends();
-    if (accept) void loadDmRecents();
+    // Create/open the DM so the new friend appears in the list and can be messaged.
+    if (accept && request) {
+      await openDm(request.requester);
+      return;
+    }
+    void loadDmRecents();
   }
 
   async function joinVoice(channel: Channel) {
@@ -2598,7 +2619,7 @@ export default function App() {
                 <div className="section-label">Mensagens diretas</div>
                 {dmRecents.length === 0 && (
                   <p className="muted empty-copy">
-                    Quando alguém te mandar mensagem, a conversa aparece aqui.
+                    Aceite um amigo ou adicione alguém pelo @username para começar a conversar.
                   </p>
                 )}
                 {dmRecents.map((dm) => {
@@ -2887,9 +2908,9 @@ export default function App() {
           ) : view.kind === "home" ? (
             <div className="home-feed">
               <div className="home-feed-title">
-                <h2>Mensagens diretas</h2>
+                <h2>Amigos e mensagens</h2>
                 <p className="muted">
-                  Escolha uma conversa à esquerda ou adicione alguém pelo botão Adicionar amigo.
+                  Aceite pedidos, abra uma conversa com um amigo ou adicione alguém pelo @username.
                 </p>
               </div>
               {friendRequests.length > 0 && (
@@ -2932,46 +2953,95 @@ export default function App() {
                   ))}
                 </section>
               )}
-              {dmRecents.length === 0 ? (
-                <EmptyState
-                  art="dms"
-                  title="Nenhuma conversa privada ainda"
-                  hint="Adicione alguém pelo @username e a conversa aparece aqui."
-                />
-              ) : (
-                <div className="home-dm-list">
-                  {dmRecents.map((dm) => {
-                    const n = dmUnread.get(dm.conversationId) ?? 0;
-                    return (
-                    <button
-                      key={dm.conversationId}
-                      type="button"
-                      className="home-dm-row"
-                      onClick={() => {
-                        setActiveGroupId(null);
-                        setView({
-                          kind: "dm",
-                          conversationId: dm.conversationId,
-                          other: dm.other,
-                        });
-                      }}
-                    >
-                      <Avatar
-                        size="lg"
-                        name={dm.other.display_name}
-                        url={dm.other.avatar_url}
-                        id={dm.other.id}
-                        status={dm.other.status}
-                      />
-                      <div className="user-panel-identity">
-                        <span className="user-panel-name">{dm.other.display_name}</span>
-                        <span className="user-panel-handle muted">@{dm.other.username}</span>
-                      </div>
-                      {n > 0 && <span className="unread-badge">{formatBadgeCount(n)}</span>}
-                    </button>
-                    );
-                  })}
-                </div>
+              <section className="home-friends">
+                <div className="section-label">Amigos — {friends.length}</div>
+                {friends.length === 0 ? (
+                  <EmptyState
+                    art="friends"
+                    title="Nenhum amigo ainda"
+                    hint="Adicione alguém pelo @username para conversar no privado."
+                  />
+                ) : (
+                  <div className="home-dm-list">
+                    {friends.map((friend) => {
+                      const existing = dmRecents.find((d) => d.other.id === friend.id);
+                      const n = existing
+                        ? dmUnread.get(existing.conversationId) ?? 0
+                        : 0;
+                      return (
+                        <div key={friend.id} className="home-request-row">
+                          <Avatar
+                            size="md"
+                            name={friend.display_name}
+                            url={friend.avatar_url}
+                            id={friend.id}
+                            status={friend.status}
+                          />
+                          <div className="user-panel-identity">
+                            <span className="user-panel-name">{friend.display_name}</span>
+                            <span className="user-panel-handle muted">
+                              @{friend.username}
+                            </span>
+                          </div>
+                          <div className="stack-row home-request-actions">
+                            {n > 0 && (
+                              <span className="unread-badge">{formatBadgeCount(n)}</span>
+                            )}
+                            <button
+                              type="button"
+                              className="neo-btn neo-btn-primary neo-btn-compact"
+                              onClick={() => void openDm(friend)}
+                            >
+                              Mensagem
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+              {dmRecents.length > 0 && (
+                <section className="home-dm-section">
+                  <div className="section-label">Conversas recentes</div>
+                  <div className="home-dm-list">
+                    {dmRecents.map((dm) => {
+                      const n = dmUnread.get(dm.conversationId) ?? 0;
+                      return (
+                        <button
+                          key={dm.conversationId}
+                          type="button"
+                          className="home-dm-row"
+                          onClick={() => {
+                            setActiveGroupId(null);
+                            setView({
+                              kind: "dm",
+                              conversationId: dm.conversationId,
+                              other: dm.other,
+                            });
+                          }}
+                        >
+                          <Avatar
+                            size="lg"
+                            name={dm.other.display_name}
+                            url={dm.other.avatar_url}
+                            id={dm.other.id}
+                            status={dm.other.status}
+                          />
+                          <div className="user-panel-identity">
+                            <span className="user-panel-name">{dm.other.display_name}</span>
+                            <span className="user-panel-handle muted">
+                              @{dm.other.username}
+                            </span>
+                          </div>
+                          {n > 0 && (
+                            <span className="unread-badge">{formatBadgeCount(n)}</span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
               )}
             </div>
           ) : inActiveVoiceView ? null : (
