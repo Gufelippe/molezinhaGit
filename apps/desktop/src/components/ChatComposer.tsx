@@ -279,7 +279,7 @@ export const ChatComposer = memo(function ChatComposer({
       {disabled && disabledHint && <p className="composer-error">{disabledHint}</p>}
 
       <div className="composer-wa" style={{ position: "relative" }}>
-        <div className="composer-field">
+        <div className="composer-tools">
           <NeoTooltip label="Emoji" side="top">
             <button
               className="composer-icon-btn"
@@ -344,12 +344,16 @@ export const ChatComposer = memo(function ChatComposer({
               if (files.length) void addFiles(files);
             }}
           />
+        </div>
+        <div className="composer-field">
           <input
             ref={inputRef}
             className="composer-input"
             placeholder={placeholder}
             value={draft}
             disabled={disabled}
+            spellCheck={false}
+            autoComplete="off"
             onPaste={(e) => {
               const files = Array.from(e.clipboardData?.files ?? []);
               if (files.length) {
