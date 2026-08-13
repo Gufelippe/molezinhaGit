@@ -2,6 +2,12 @@ import type { types as msTypes } from "mediasoup-client";
 import type { CallServerMessage, MediaSource, MusicChannelState } from "@molezinha/shared";
 import { CALLS_URL } from "./supabase";
 import {
+  playCallJoinSound,
+  playCallLeaveSound,
+  unlockCallSounds,
+} from "./callSounds";
+import { createVoiceChain, type VoiceChain } from "./audioChain";
+import {
   applyVoiceProcessing,
   buildAudioConstraints,
   buildScreenConstraints,
@@ -68,6 +74,7 @@ export class CallClient {
   private joinLock: Promise<void> = Promise.resolve();
   private audioMuted = false;
   private videoEnabled = false;
+  private leaving = false;
   /** Producers that arrived before recv transport was ready */
   private pendingConsumes: Array<{
     peerId: string;
@@ -79,13 +86,18 @@ export class CallClient {
   private consumers = new Map<string, msTypes.Consumer>();
   /** producerId → capture it came from, so screen tracks land on the right stream */
   private remoteSources = new Map<string, MediaSource>();
-  private audioCtx: AudioContext | null = null;
-  private inputGainNode: GainNode | null = null;
+  private voiceChain: VoiceChain | null = null;
   private rawMicTrack: MediaStreamTrack | null = null;
-  /** Processing flags the live mic capture was opened with. */
-  private appliedProcessing: Pick<
+  /** Constraints the live mic capture was opened with. */
+  private appliedCapture: {
+    noiseSuppression: boolean;
+    echoCancellation: boolean;
+    autoGainControl: boolean;
+  } | null = null;
+  /** Settings the current processing chain was built from. */
+  private appliedChain: Pick<
     VoiceSettings,
-    "noiseSuppression" | "echoCancellation" | "autoGainControl"
+    "noiseSuppression" | "noiseGate" | "inputGain"
   > | null = null;
   private unsubVoiceSettings: (() => void) | null = null;
 
@@ -208,15 +220,19 @@ export class CallClient {
           videoMuted: true,
         });
         this.emit();
+        if (!isMusicPeerId(msg.peer.peerId)) playCallJoinSound();
       }
       return;
     }
 
     if (msg.type === "peerLeft") {
+      const wasHumanPeer =
+        this.peers.has(msg.peerId) && !isMusicPeerId(msg.peerId);
       this.localPeerIds.delete(msg.peerId);
       this.peers.delete(msg.peerId);
       this.peerNames.delete(msg.peerId);
       this.emit();
+      if (wasHumanPeer) playCallLeaveSound();
       return;
     }
 
@@ -323,6 +339,7 @@ export class CallClient {
     token: string,
     opts: { audio: boolean; video: boolean; muteOnJoin: boolean; userId: string }
   ) {
+    unlockCallSounds();
     const run = async () => {
       await this.leaveInternal();
       this.channelId = channelId;
@@ -420,7 +437,7 @@ export class CallClient {
       if (opts.audio) {
         const raw = capture.getAudioTracks()[0];
         if (raw) {
-          const processed = await this.setupInputGain(raw);
+          const processed = await this.setupMicTrack(raw);
           audioTracks.push(processed);
         }
       }
@@ -475,6 +492,7 @@ export class CallClient {
       }
 
       this.emit();
+      playCallJoinSound();
     };
 
     const next = this.joinLock.then(run, run);
@@ -485,41 +503,50 @@ export class CallClient {
     return next;
   }
 
-  private async setupInputGain(
+  /** Wraps a fresh mic capture in the processing chain and adopts it. */
+  private async setupMicTrack(
     raw: MediaStreamTrack,
     settings: VoiceSettings = readVoiceSettings()
   ): Promise<MediaStreamTrack> {
     this.teardownAudioPipeline();
     this.rawMicTrack = raw;
-    this.appliedProcessing = {
-      noiseSuppression: settings.noiseSuppression,
+    this.appliedCapture = {
+      noiseSuppression: settings.noiseSuppression !== "off",
       echoCancellation: settings.echoCancellation,
       autoGainControl: settings.autoGainControl,
     };
-    // Web Audio only earns its latency when the gain is actually changed.
-    if (settings.inputGain === 1) return raw;
-    this.audioCtx = new AudioContext();
-    await this.audioCtx.resume().catch(() => undefined);
-    const source = this.audioCtx.createMediaStreamSource(new MediaStream([raw]));
-    this.inputGainNode = this.audioCtx.createGain();
-    this.inputGainNode.gain.value = settings.inputGain;
-    const dest = this.audioCtx.createMediaStreamDestination();
-    source.connect(this.inputGainNode);
-    this.inputGainNode.connect(dest);
-    const out = dest.stream.getAudioTracks()[0];
-    if (!out) throw new Error("Falha ao processar áudio de entrada");
-    return out;
+    return (await this.buildVoiceChain(raw, settings)) ?? raw;
   }
 
-  private teardownAudioPipeline() {
+  private async buildVoiceChain(raw: MediaStreamTrack, settings: VoiceSettings) {
+    this.appliedChain = {
+      noiseSuppression: settings.noiseSuppression,
+      noiseGate: settings.noiseGate,
+      inputGain: settings.inputGain,
+    };
     try {
-      this.audioCtx?.close();
+      this.voiceChain = await createVoiceChain(raw, settings);
+    } catch (err) {
+      // A broken worklet must never cost the user their microphone.
+      console.warn("[call] processamento de áudio indisponível", err);
+      this.voiceChain = null;
+    }
+    return this.voiceChain?.track ?? null;
+  }
+
+  private closeVoiceChain() {
+    try {
+      this.voiceChain?.close();
     } catch {
       /* ignore */
     }
-    this.audioCtx = null;
-    this.inputGainNode = null;
-    this.appliedProcessing = null;
+    this.voiceChain = null;
+    this.appliedChain = null;
+  }
+
+  private teardownAudioPipeline() {
+    this.closeVoiceChain();
+    this.appliedCapture = null;
     if (this.rawMicTrack) {
       try {
         this.rawMicTrack.stop();
@@ -531,20 +558,28 @@ export class CallClient {
   }
 
   async applyLiveVoiceSettings(settings: VoiceSettings = readVoiceSettings()) {
-    const applied = this.appliedProcessing;
-    const processingChanged =
-      !applied ||
-      applied.noiseSuppression !== settings.noiseSuppression ||
-      applied.echoCancellation !== settings.echoCancellation ||
-      applied.autoGainControl !== settings.autoGainControl;
-    // The gain node is added on demand; once it exists it stays, so dragging the
-    // slider back through 1 doesn't re-open the mic.
-    const needsGainNode = settings.inputGain !== 1 && !this.inputGainNode;
+    const capture = this.appliedCapture;
+    const captureChanged =
+      !capture ||
+      capture.noiseSuppression !== (settings.noiseSuppression !== "off") ||
+      capture.echoCancellation !== settings.echoCancellation ||
+      capture.autoGainControl !== settings.autoGainControl;
+    const chain = this.appliedChain;
+    // Gain is a live parameter; the suppressor and the gate are wired at build
+    // time, so changing them means rebuilding the graph (but not the capture).
+    const chainChanged =
+      !chain ||
+      chain.noiseSuppression !== settings.noiseSuppression ||
+      chain.noiseGate !== settings.noiseGate ||
+      (chain.inputGain !== settings.inputGain && !this.voiceChain);
 
-    if (this.rawMicTrack && (processingChanged || needsGainNode)) {
+    if (this.rawMicTrack && captureChanged) {
       await this.restartMicTrack(settings);
-    } else if (this.inputGainNode) {
-      this.inputGainNode.gain.value = settings.inputGain;
+    } else if (this.rawMicTrack && chainChanged) {
+      await this.rebuildVoiceChain(settings);
+    } else if (this.voiceChain && chain) {
+      this.voiceChain.setGain(settings.inputGain);
+      chain.inputGain = settings.inputGain;
     }
 
     await this.applyVideoBitrate(this.videoProducer, "camera", settings);
@@ -575,7 +610,7 @@ export class CallClient {
     if (!raw) return;
 
     const previousAudio = this.localStream?.getAudioTracks() ?? [];
-    const outgoing = await this.setupInputGain(raw, settings);
+    const outgoing = await this.setupMicTrack(raw, settings);
     outgoing.enabled = !this.audioMuted;
 
     if (producer && !producer.closed) {
@@ -593,6 +628,39 @@ export class CallClient {
       } catch {
         /* ignore */
       }
+    }
+
+    const otherTracks = this.localStream?.getTracks().filter((t) => t.kind !== "audio") ?? [];
+    this.localStream = new MediaStream([outgoing, ...otherTracks]);
+    this.emit();
+  }
+
+  /**
+   * Swaps the processing graph while keeping the same capture, so toggling the
+   * suppressor mid-call doesn't drop a word.
+   */
+  private async rebuildVoiceChain(settings: VoiceSettings) {
+    const raw = this.rawMicTrack;
+    if (!raw) return;
+    const producer = this.audioProducer;
+    const previous = this.voiceChain;
+    this.voiceChain = null;
+
+    const outgoing = (await this.buildVoiceChain(raw, settings)) ?? raw;
+    outgoing.enabled = !this.audioMuted;
+
+    if (producer && !producer.closed) {
+      try {
+        await producer.replaceTrack({ track: outgoing });
+      } catch (err) {
+        console.warn("[call] replaceTrack failed", err);
+      }
+    }
+
+    try {
+      previous?.close();
+    } catch {
+      /* ignore */
     }
 
     const otherTracks = this.localStream?.getTracks().filter((t) => t.kind !== "audio") ?? [];
@@ -738,6 +806,15 @@ export class CallClient {
 
       // Trust the server echo — appData is authoritative for who owns the track.
       let resolvedSource = consumed.appData?.source ?? source;
+
+      // Display capture survives as `displaySurface` on some Chromium tracks,
+      // even when an older peer omitted appData.source.
+      if (kind === "video" && resolvedSource !== "screen") {
+        const settings = consumer.track.getSettings() as MediaTrackSettings & {
+          displaySurface?: string;
+        };
+        if (settings.displaySurface) resolvedSource = "screen";
+      }
 
       // Older clients publish without appData. A peer only ever has one camera,
       // so a second live video track can only be a screen share.
@@ -940,8 +1017,16 @@ export class CallClient {
   }
 
   async leave() {
+    if (this.leaving) return;
+    this.leaving = true;
+    const wasInCall = Boolean(this.channelId);
+    if (wasInCall) playCallLeaveSound();
     this.joinGeneration += 1;
-    await this.leaveInternal();
+    try {
+      await this.leaveInternal();
+    } finally {
+      this.leaving = false;
+    }
   }
 
   private async leaveInternal() {

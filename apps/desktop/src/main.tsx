@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { AuthProvider } from "./lib/auth";
 import { hasSupabaseConfig, supabaseConfigError } from "./lib/supabase";
 import { BootError } from "./components/BootError";
+import { preloadNoiseSuppressor } from "./lib/audioChain";
 import App from "./App";
 import "@fontsource-variable/syne";
 import "@fontsource-variable/figtree";
@@ -46,6 +47,8 @@ if (!hasSupabaseConfig) {
     />
   );
 } else {
+  // Fetch the denoiser wasm up front so the first join isn't held up by it.
+  preloadNoiseSuppressor();
   root.render(
     <StrictMode>
       <RootErrorBoundary>

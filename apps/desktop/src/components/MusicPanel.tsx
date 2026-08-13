@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import type { MusicChannelState } from "@molezinha/shared";
 import { callClient } from "../lib/calls";
 import { musicApi } from "../lib/musicApi";
-import { IconMusic } from "./Icons";
+import { IconMusic, IconPlus } from "./Icons";
 import { NeoRange } from "./NeoControls";
+import { NeoTooltip } from "./NeoTooltip";
 
 type Props = {
   channelId: string;
@@ -39,11 +40,14 @@ export function MusicPanel({ channelId, userId, isStaff }: Props) {
     Boolean(now) && (isStaff || now?.requestedBy === userId);
 
   return (
-    <div className="music-panel">
-      <div className="music-panel-head">
-        <IconMusic />
-        <strong>Música</strong>
-      </div>
+    <section className="call-card music-panel">
+      <header className="call-card-head">
+        <span className="call-card-title">
+          <IconMusic className="icon call-card-title-icon" />
+          Música
+        </span>
+        {queue.length > 0 && <span className="call-pill">{queue.length}</span>}
+      </header>
 
       <form
         className="music-panel-form"
@@ -60,13 +64,20 @@ export function MusicPanel({ channelId, userId, isStaff }: Props) {
         <input
           className="neo-input"
           value={url}
-          placeholder="Cole o link do YouTube"
+          placeholder="Link do YouTube"
           disabled={busy}
           onChange={(e) => setUrl(e.target.value)}
         />
-        <button className="neo-btn neo-btn-compact neo-btn-primary" type="submit" disabled={busy || !url.trim()}>
-          Enfileirar
-        </button>
+        <NeoTooltip label="Enfileirar" side="top">
+          <button
+            className="call-ctrl call-ctrl-sm"
+            type="submit"
+            aria-label="Enfileirar música"
+            disabled={busy || !url.trim()}
+          >
+            <IconPlus />
+          </button>
+        </NeoTooltip>
       </form>
 
       {now ? (
@@ -132,7 +143,10 @@ export function MusicPanel({ channelId, userId, isStaff }: Props) {
       )}
 
       <div className="music-volume">
-        <label htmlFor="music-volume">Volume da música ({volume}%)</label>
+        <div className="music-volume-head">
+          <label htmlFor="music-volume">Volume</label>
+          <span className="music-volume-value">{volume}%</span>
+        </div>
         <NeoRange
           id="music-volume"
           min={0}
@@ -148,6 +162,6 @@ export function MusicPanel({ channelId, userId, isStaff }: Props) {
       </div>
 
       {error && <p className="music-error">{error}</p>}
-    </div>
+    </section>
   );
 }

@@ -1,8 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import type { MusicChannelState } from "@molezinha/shared";
 import { callClient, isMusicPeerId, type RemotePeerMedia } from "../lib/calls";
+import { useAuth } from "../lib/auth";
 import { onVoiceSettingsChange, readVoiceSettings, applyAudioOutput } from "../lib/voiceSettings";
 import {
+  IconCollapse,
+  IconExpand,
+  IconFullscreen,
+  IconFullscreenExit,
   IconMic,
   IconMicOff,
   IconMusic,
@@ -11,6 +16,8 @@ import {
   IconVideo,
   IconVideoOff,
 } from "./Icons";
+import { Avatar } from "./Avatar";
+import { NeoTooltip } from "./NeoTooltip";
 import { MusicPanel } from "./MusicPanel";
 
 interface Props {
@@ -39,11 +46,16 @@ function kickRemoteAudioPlayback() {
   }
 }
 
-function initialOf(name: string) {
-  return (name || "?")[0]?.toUpperCase() ?? "?";
+function formatElapsed(totalSeconds: number) {
+  const s = totalSeconds % 60;
+  const m = Math.floor(totalSeconds / 60) % 60;
+  const h = Math.floor(totalSeconds / 3600);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
 export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Props) {
+  const { profile } = useAuth();
   const initial = callClient.getMediaState();
   const [muted, setMuted] = useState(initial.audioMuted);
   const [videoOn, setVideoOn] = useState(initial.videoEnabled);
@@ -56,10 +68,19 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
   const [musicState, setMusicState] = useState<MusicChannelState | null>(() =>
     callClient.getMusicState()
   );
-  const localVideoRef = useRef<HTMLVideoElement>(null);
-  const localScreenRef = useRef<HTMLVideoElement>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [focusedTile, setFocusedTile] = useState<string | null>(null);
 
   useEffect(() => callClient.onMusicState(setMusicState), []);
+
+  useEffect(() => {
+    const startedAt = Date.now();
+    const id = window.setInterval(
+      () => setElapsed(Math.floor((Date.now() - startedAt) / 1000)),
+      1000
+    );
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const unsub = callClient.onUpdate((nextPeers, local, media) => {
@@ -81,28 +102,6 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       kickRemoteAudioPlayback();
     });
   }, []);
-
-  useEffect(() => {
-    const el = localVideoRef.current;
-    if (!el) return;
-    if (videoOn && localStream?.getVideoTracks().some((t) => t.readyState === "live")) {
-      el.srcObject = localStream;
-      void el.play().catch(() => undefined);
-    } else {
-      el.srcObject = null;
-    }
-  }, [localStream, videoOn]);
-
-  useEffect(() => {
-    const el = localScreenRef.current;
-    if (!el) return;
-    if (sharing && screenStream) {
-      el.srcObject = screenStream;
-      void el.play().catch(() => undefined);
-    } else {
-      el.srcObject = null;
-    }
-  }, [screenStream, sharing]);
 
   async function toggleMute() {
     if (busy) return;
@@ -153,8 +152,89 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
   const humanPeers = peerList.filter((p) => !isMusicPeerId(p.peerId));
   const musicPeers = peerList.filter((p) => isMusicPeerId(p.peerId));
   const screenPeers = humanPeers.filter((p) => p.screenStream);
-  // A shared screen takes the stage; cameras drop to a strip so no tile is starved.
-  const hasStage = sharing || screenPeers.length > 0;
+  const selfName = profile?.display_name || "Você";
+
+  function toggleFocus(key: string) {
+    setFocusedTile((current) => (current === key ? null : key));
+  }
+
+  const tiles: CallTile[] = [];
+  if (sharing && screenStream) {
+    tiles.push({
+      key: "local:screen",
+      isScreen: true,
+      render: (opts) => (
+        <LocalScreenTile
+          stream={screenStream}
+          focused={opts.focused}
+          allowFocus={opts.allowFocus}
+          onToggleFocus={() => toggleFocus("local:screen")}
+        />
+      ),
+    });
+  }
+  for (const peer of screenPeers) {
+    const key = `${peer.peerId}:screen`;
+    tiles.push({
+      key,
+      isScreen: true,
+      render: (opts) => (
+        <RemoteScreenTile
+          peer={peer}
+          focused={opts.focused}
+          allowFocus={opts.allowFocus}
+          onToggleFocus={() => toggleFocus(key)}
+        />
+      ),
+    });
+  }
+  tiles.push({
+    key: "local:cam",
+    isScreen: false,
+    render: (opts) => (
+      <LocalCamTile
+        stream={localStream}
+        videoOn={videoOn}
+        muted={muted}
+        name={selfName}
+        avatarUrl={profile?.avatar_url}
+        userId={userId}
+        focused={opts.focused}
+        allowFocus={opts.allowFocus}
+        onToggleFocus={() => toggleFocus("local:cam")}
+      />
+    ),
+  });
+  for (const peer of humanPeers) {
+    tiles.push({
+      key: peer.peerId,
+      isScreen: false,
+      render: (opts) => (
+        <RemoteTile
+          peer={peer}
+          focused={opts.focused}
+          allowFocus={opts.allowFocus}
+          onToggleFocus={() => toggleFocus(peer.peerId)}
+        />
+      ),
+    });
+  }
+
+  // An explicit pick wins; otherwise shared screens claim the stage on their own.
+  const focusedExists = tiles.some((t) => t.key === focusedTile);
+  const staged = focusedExists
+    ? tiles.filter((t) => t.key === focusedTile)
+    : tiles.filter((t) => t.isScreen);
+  const stagedKeys = new Set(staged.map((t) => t.key));
+  const strip = tiles.filter((t) => !stagedKeys.has(t.key));
+  const hasStage = staged.length > 0;
+  const tileKeys = tiles.map((t) => t.key).join("|");
+
+  useEffect(() => {
+    if (focusedTile && !tileKeys.split("|").includes(focusedTile)) {
+      setFocusedTile(null);
+    }
+  }, [focusedTile, tileKeys]);
 
   return (
     <div
@@ -167,117 +247,132 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
         <div className="call-media">
           {hasStage && (
             <div className="screen-stage">
-              {sharing && (
-                <div className="video-tile video-tile-screen">
-                  <video ref={localScreenRef} autoPlay muted playsInline />
-                  <span className="label">Sua tela</span>
-                </div>
-              )}
-              {screenPeers.map((peer) => (
-                <RemoteScreenTile key={`${peer.peerId}:screen`} peer={peer} />
+              {staged.map((tile) => (
+                <Fragment key={tile.key}>
+                  {tile.render({
+                    focused: focusedExists,
+                    allowFocus: focusedExists || staged.length > 1 || !tile.isScreen,
+                  })}
+                </Fragment>
               ))}
             </div>
           )}
-          <div className={`video-grid ${hasStage ? "video-grid-strip" : ""}`}>
-            <div className={`video-tile ${videoOn ? "" : "video-tile-off"}`}>
-              {videoOn ? (
-                <video ref={localVideoRef} autoPlay muted playsInline />
-              ) : (
-                <div className="video-tile-placeholder">Câmera off</div>
-              )}
-              <span className="label">
-                Você{muted ? " · mudo" : ""}
-              </span>
+          {strip.length > 0 && (
+            <div
+              className={`video-grid ${hasStage ? "video-grid-strip" : ""}`}
+              data-count={strip.length}
+            >
+              {strip.map((tile) => (
+                <Fragment key={tile.key}>
+                  {tile.render({ focused: false, allowFocus: true })}
+                </Fragment>
+              ))}
             </div>
-            {humanPeers.map((peer) => (
-              <RemoteTile key={peer.peerId} peer={peer} />
-            ))}
-            {/* Music bot is audio-only — keep a hidden player, no video tile. */}
-            {musicPeers.map((peer) => (
-              <MusicAudio key={peer.peerId} peer={peer} />
-            ))}
-          </div>
+          )}
+          {/* Music bot is audio-only — keep a hidden player, no video tile. */}
+          {musicPeers.map((peer) => (
+            <MusicAudio key={peer.peerId} peer={peer} />
+          ))}
         </div>
 
-        <aside className="call-roster" aria-label="Quem está na call">
-          <div className="call-roster-title">Na call — {humanPeers.length + 1}</div>
-          <div className="call-roster-list">
-            <div className="call-roster-row">
-              <div className="call-roster-avatar">Vc</div>
-              <span className="call-roster-name">Você</span>
-              <span className="call-roster-flags">
-                {muted && <IconMicOff className="icon call-roster-flag danger" />}
-                {!videoOn && <IconVideoOff className="icon call-roster-flag off" />}
-                {sharing && <IconScreen className="icon call-roster-flag live" />}
-              </span>
-            </div>
-            {humanPeers.map((peer) => (
-              <div className="call-roster-row" key={peer.peerId}>
-                <div className="call-roster-avatar">{initialOf(peer.displayName)}</div>
-                <span className="call-roster-name">{peer.displayName}</span>
+        <aside className="call-side" aria-label="Quem está na call">
+          <section className="call-card call-roster">
+            <header className="call-card-head">
+              <span className="call-card-title">Na call</span>
+              <span className="call-pill">{humanPeers.length + 1}</span>
+            </header>
+            <div className="call-roster-list">
+              <div className="call-roster-row">
+                <Avatar name={selfName} url={profile?.avatar_url} id={userId} size="sm" />
+                <span className="call-roster-name">Você</span>
                 <span className="call-roster-flags">
-                  {peer.audioMuted && <IconMicOff className="icon call-roster-flag danger" />}
-                  {peer.videoMuted && <IconVideoOff className="icon call-roster-flag off" />}
-                  {peer.screenStream && <IconScreen className="icon call-roster-flag live" />}
+                  {muted && <IconMicOff className="icon call-roster-flag danger" />}
+                  {!videoOn && <IconVideoOff className="icon call-roster-flag off" />}
+                  {sharing && <IconScreen className="icon call-roster-flag live" />}
                 </span>
               </div>
-            ))}
-            {musicPeers.map((peer) => (
-              <div className="call-roster-row" key={peer.peerId}>
-                <div className="call-roster-avatar call-roster-avatar-music">
-                  <IconMusic />
+              {humanPeers.map((peer) => (
+                <div className="call-roster-row" key={peer.peerId}>
+                  <Avatar name={peer.displayName} id={peer.peerId} size="sm" />
+                  <span className="call-roster-name">{peer.displayName}</span>
+                  <span className="call-roster-flags">
+                    {peer.audioMuted && <IconMicOff className="icon call-roster-flag danger" />}
+                    {peer.videoMuted && <IconVideoOff className="icon call-roster-flag off" />}
+                    {peer.screenStream && <IconScreen className="icon call-roster-flag live" />}
+                  </span>
                 </div>
-                <span className="call-roster-name">
-                  {musicState?.nowPlaying?.title || peer.displayName}
-                </span>
-                <span className="call-roster-flags">
-                  <IconMusic className="icon call-roster-flag live" />
-                </span>
-              </div>
-            ))}
-          </div>
+              ))}
+              {musicPeers.map((peer) => (
+                <div className="call-roster-row" key={peer.peerId}>
+                  <span className="call-roster-bot">
+                    <IconMusic />
+                  </span>
+                  <span className="call-roster-name">
+                    {musicState?.nowPlaying?.title || peer.displayName}
+                  </span>
+                  <span className="call-roster-flags">
+                    <IconMusic className="icon call-roster-flag live" />
+                  </span>
+                </div>
+              ))}
+            </div>
+          </section>
           <MusicPanel channelId={channelId} userId={userId} isStaff={isStaff} />
         </aside>
       </div>
 
-      {status && <p className="muted call-status">{status}</p>}
+      {status && <p className="call-status">{status}</p>}
       <div className="call-bar">
         <div className="call-bar-id">
-          <strong className="call-bar-channel">#{channelName}</strong>
-          <span className="muted call-bar-count">{peers.size + 1} na call</span>
+          <span className="call-live">
+            <i aria-hidden />
+            Ao vivo
+          </span>
+          <span className="call-bar-meta">
+            #{channelName} · <time>{formatElapsed(elapsed)}</time>
+          </span>
         </div>
-        <div className="stack-row call-bar-actions">
+        <div className="call-bar-actions">
+          <NeoTooltip label={muted ? "Desmutar" : "Mutar"} side="top">
+            <button
+              className={`call-ctrl ${muted ? "call-ctrl-danger" : ""}`}
+              type="button"
+              disabled={busy}
+              aria-pressed={muted}
+              aria-label={muted ? "Desmutar microfone" : "Mutar microfone"}
+              onClick={() => void toggleMute()}
+            >
+              {muted ? <IconMicOff /> : <IconMic />}
+            </button>
+          </NeoTooltip>
+          <NeoTooltip label={videoOn ? "Desligar câmera" : "Ligar câmera"} side="top">
+            <button
+              className={`call-ctrl ${videoOn ? "call-ctrl-on" : ""}`}
+              type="button"
+              disabled={busy}
+              aria-pressed={videoOn}
+              aria-label={videoOn ? "Desligar câmera" : "Ligar câmera"}
+              onClick={() => void toggleCamera()}
+            >
+              {videoOn ? <IconVideo /> : <IconVideoOff />}
+            </button>
+          </NeoTooltip>
+          <NeoTooltip label={sharing ? "Parar de compartilhar" : "Compartilhar tela"} side="top">
+            <button
+              className={`call-ctrl ${sharing ? "call-ctrl-on" : ""}`}
+              type="button"
+              disabled={busy}
+              aria-pressed={sharing}
+              aria-label={sharing ? "Parar de compartilhar a tela" : "Compartilhar tela"}
+              onClick={() => void toggleShare()}
+            >
+              <IconScreen />
+            </button>
+          </NeoTooltip>
+        </div>
+        <div className="call-bar-end">
           <button
-            className={`neo-btn ${muted ? "neo-btn-danger" : ""}`}
-            type="button"
-            disabled={busy}
-            onClick={() => void toggleMute()}
-          >
-            {muted ? <IconMicOff /> : <IconMic />}
-            {muted ? "Desmutar" : "Mutar"}
-          </button>
-          <button
-            className={`neo-btn ${videoOn ? "" : "neo-btn-danger"}`}
-            type="button"
-            disabled={busy}
-            aria-pressed={videoOn}
-            onClick={() => void toggleCamera()}
-          >
-            {videoOn ? <IconVideo /> : <IconVideoOff />}
-            {videoOn ? "Desligar câmera" : "Ligar câmera"}
-          </button>
-          <button
-            className={`neo-btn ${sharing ? "neo-btn-primary" : ""}`}
-            type="button"
-            disabled={busy}
-            aria-pressed={sharing}
-            onClick={() => void toggleShare()}
-          >
-            <IconScreen />
-            {sharing ? "Parar tela" : "Compartilhar tela"}
-          </button>
-          <button
-            className="neo-btn neo-btn-danger"
+            className="call-ctrl call-ctrl-leave"
             type="button"
             disabled={busy}
             onClick={() => {
@@ -291,6 +386,207 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
         </div>
       </div>
     </div>
+  );
+}
+
+type TileRenderOpts = {
+  focused: boolean;
+  /** Hide enlarge when a lone screen is already filling the stage. */
+  allowFocus: boolean;
+};
+
+type CallTile = {
+  key: string;
+  /** Screen shares take the stage even when nothing is explicitly focused. */
+  isScreen: boolean;
+  render: (opts: TileRenderOpts) => ReactNode;
+};
+
+interface TileShellProps {
+  focused: boolean;
+  allowFocus: boolean;
+  onToggleFocus: () => void;
+  tag: ReactNode;
+  screen?: boolean;
+  off?: boolean;
+  children: ReactNode;
+}
+
+/** Tile chrome: the name tag plus the enlarge / fullscreen controls. */
+function TileShell({
+  focused,
+  allowFocus,
+  onToggleFocus,
+  tag,
+  screen,
+  off,
+  children,
+}: TileShellProps) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    const sync = () => setFullscreen(document.fullscreenElement === ref.current);
+    document.addEventListener("fullscreenchange", sync);
+    return () => document.removeEventListener("fullscreenchange", sync);
+  }, []);
+
+  function toggleFullscreen() {
+    const el = ref.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      void document.exitFullscreen().catch(() => undefined);
+    } else {
+      void el.requestFullscreen().catch((err) => console.warn("[call] fullscreen failed", err));
+    }
+  }
+
+  return (
+    <div
+      ref={ref}
+      className={`video-tile${screen ? " video-tile-screen" : ""}${off ? " video-tile-off" : ""}`}
+      onDoubleClick={toggleFullscreen}
+    >
+      {children}
+      <span className="video-tile-tag">{tag}</span>
+      <div className="video-tile-actions">
+        {allowFocus && (
+          <button
+            className="tile-btn"
+            type="button"
+            title={focused ? "Voltar ao tamanho normal" : "Ampliar"}
+            aria-label={focused ? "Voltar ao tamanho normal" : "Ampliar"}
+            aria-pressed={focused}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleFocus();
+            }}
+            onDoubleClick={(e) => e.stopPropagation()}
+          >
+            {focused ? <IconCollapse /> : <IconExpand />}
+          </button>
+        )}
+        <button
+          className="tile-btn"
+          type="button"
+          title={fullscreen ? "Sair da tela cheia" : "Tela cheia"}
+          aria-label={fullscreen ? "Sair da tela cheia" : "Tela cheia"}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleFullscreen();
+          }}
+          onDoubleClick={(e) => e.stopPropagation()}
+        >
+          {fullscreen ? <IconFullscreenExit /> : <IconFullscreen />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+interface LocalCamTileProps {
+  stream: MediaStream | null;
+  videoOn: boolean;
+  muted: boolean;
+  name: string;
+  avatarUrl?: string | null;
+  userId: string;
+  focused: boolean;
+  allowFocus: boolean;
+  onToggleFocus: () => void;
+}
+
+function LocalCamTile({
+  stream,
+  videoOn,
+  muted,
+  name,
+  avatarUrl,
+  userId,
+  focused,
+  allowFocus,
+  onToggleFocus,
+}: LocalCamTileProps) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const live = videoOn && Boolean(stream?.getVideoTracks().some((t) => t.readyState === "live"));
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    if (live && stream) {
+      el.srcObject = stream;
+      void el.play().catch(() => undefined);
+    } else {
+      el.srcObject = null;
+    }
+  }, [stream, live]);
+
+  return (
+    <TileShell
+      focused={focused}
+      allowFocus={allowFocus}
+      onToggleFocus={onToggleFocus}
+      off={!live}
+      tag={
+        <>
+          {muted ? (
+            <IconMicOff className="icon video-tile-tag-icon danger" />
+          ) : (
+            <IconMic className="icon video-tile-tag-icon" />
+          )}
+          Você
+        </>
+      }
+    >
+      {live ? (
+        <video className="video-tile-mirror" ref={videoRef} autoPlay muted playsInline />
+      ) : (
+        <div className="video-tile-placeholder">
+          <Avatar name={name} url={avatarUrl} id={userId} size="xl" />
+        </div>
+      )}
+    </TileShell>
+  );
+}
+
+function LocalScreenTile({
+  stream,
+  focused,
+  allowFocus,
+  onToggleFocus,
+}: {
+  stream: MediaStream;
+  focused: boolean;
+  allowFocus: boolean;
+  onToggleFocus: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    el.srcObject = stream;
+    void el.play().catch(() => undefined);
+    return () => {
+      el.srcObject = null;
+    };
+  }, [stream]);
+
+  return (
+    <TileShell
+      screen
+      focused={focused}
+      allowFocus={allowFocus}
+      onToggleFocus={onToggleFocus}
+      tag={
+        <>
+          <IconScreen className="icon video-tile-tag-icon live" />
+          Sua tela
+        </>
+      }
+    >
+      <video ref={videoRef} autoPlay muted playsInline />
+    </TileShell>
   );
 }
 
@@ -332,7 +628,17 @@ function MusicAudio({ peer }: { peer: RemotePeerMedia }) {
   );
 }
 
-function RemoteTile({ peer }: { peer: RemotePeerMedia }) {
+function RemoteTile({
+  peer,
+  focused,
+  allowFocus,
+  onToggleFocus,
+}: {
+  peer: RemotePeerMedia;
+  focused: boolean;
+  allowFocus: boolean;
+  onToggleFocus: () => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const hasLiveVideo =
@@ -376,23 +682,46 @@ function RemoteTile({ peer }: { peer: RemotePeerMedia }) {
   }, [peer.stream, hasLiveVideo, peer.videoMuted]);
 
   return (
-    <div className={`video-tile ${hasLiveVideo ? "" : "video-tile-off"}`}>
+    <TileShell
+      focused={focused}
+      allowFocus={allowFocus}
+      onToggleFocus={onToggleFocus}
+      off={!hasLiveVideo}
+      tag={
+        <>
+          {peer.audioMuted ? (
+            <IconMicOff className="icon video-tile-tag-icon danger" />
+          ) : (
+            <IconMic className="icon video-tile-tag-icon" />
+          )}
+          {peer.displayName}
+          {peer.screenStream && <IconScreen className="icon video-tile-tag-icon live" />}
+        </>
+      }
+    >
       <audio ref={audioRef} className="call-remote-audio" autoPlay playsInline />
       {hasLiveVideo ? (
         <video ref={videoRef} autoPlay playsInline muted />
       ) : (
-        <div className="video-tile-placeholder">{peer.displayName[0]?.toUpperCase() ?? "?"}</div>
+        <div className="video-tile-placeholder">
+          <Avatar name={peer.displayName} id={peer.peerId} size="xl" />
+        </div>
       )}
-      <span className="label">
-        {peer.displayName}
-        {peer.audioMuted ? " · mudo" : ""}
-        {peer.videoMuted || !hasLiveVideo ? " · cam off" : ""}
-      </span>
-    </div>
+    </TileShell>
   );
 }
 
-function RemoteScreenTile({ peer }: { peer: RemotePeerMedia }) {
+function RemoteScreenTile({
+  peer,
+  focused,
+  allowFocus,
+  onToggleFocus,
+}: {
+  peer: RemotePeerMedia;
+  focused: boolean;
+  allowFocus: boolean;
+  onToggleFocus: () => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const screen = peer.screenStream;
 
@@ -410,9 +739,19 @@ function RemoteScreenTile({ peer }: { peer: RemotePeerMedia }) {
   if (!screen) return null;
 
   return (
-    <div className="video-tile video-tile-screen">
+    <TileShell
+      screen
+      focused={focused}
+      allowFocus={allowFocus}
+      onToggleFocus={onToggleFocus}
+      tag={
+        <>
+          <IconScreen className="icon video-tile-tag-icon live" />
+          Tela de {peer.displayName}
+        </>
+      }
+    >
       <video ref={videoRef} autoPlay playsInline muted />
-      <span className="label">Tela de {peer.displayName}</span>
-    </div>
+    </TileShell>
   );
 }

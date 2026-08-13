@@ -25,6 +25,9 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
+    // AudioWorklet modules must be real files: `addModule()` rejects the data
+    // URIs Vite would inline small assets into.
+    assetsInlineLimit: (filePath) => (filePath.includes("workletProcessor") ? false : undefined),
     rollupOptions: {
       output: {
         manualChunks: {

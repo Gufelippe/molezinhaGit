@@ -2,8 +2,29 @@ const STORAGE_KEY = "molezinha.voice";
 
 export type VideoQuality = "low" | "medium" | "high";
 
+/**
+ * `browser` is the WebRTC suppressor, which only deals with steady noise (fan,
+ * hiss). `strong` adds an RNNoise pass that also kills transients — keyboard,
+ * finger snaps, mouse clicks.
+ */
+export type NoiseSuppressionMode = "off" | "browser" | "strong";
+
+/** Gate threshold meaning "never gate". */
+export const GATE_OFF_DB = -100;
+
+export const NOISE_SUPPRESSION_OPTIONS: { value: NoiseSuppressionMode; label: string }[] = [
+  { value: "off", label: "Desligada" },
+  { value: "browser", label: "Padrão — só ruído constante" },
+  { value: "strong", label: "Forte — corta teclado e estalos" },
+];
+
 export type VoiceSettings = {
-  noiseSuppression: boolean;
+  noiseSuppression: NoiseSuppressionMode;
+  /**
+   * Anything quieter than this (dBFS) is muted before it reaches the call.
+   * `GATE_OFF_DB` disables the gate.
+   */
+  noiseGate: number;
   echoCancellation: boolean;
   autoGainControl: boolean;
   /** Linear gain applied before sending (0.5–2). */
@@ -17,7 +38,8 @@ export type VoiceSettings = {
 };
 
 export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
-  noiseSuppression: true,
+  noiseSuppression: "strong",
+  noiseGate: -50,
   echoCancellation: true,
   autoGainControl: true,
   inputGain: 1,
@@ -51,6 +73,13 @@ function isVideoQuality(v: unknown): v is VideoQuality {
   return v === "low" || v === "medium" || v === "high";
 }
 
+/** Accepts the legacy boolean shape so existing installs keep their choice. */
+function readNoiseSuppression(v: unknown): NoiseSuppressionMode {
+  if (v === "off" || v === "browser" || v === "strong") return v;
+  if (v === false) return "off";
+  return DEFAULT_VOICE_SETTINGS.noiseSuppression;
+}
+
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
 }
@@ -61,7 +90,14 @@ export function readVoiceSettings(): VoiceSettings {
     if (!raw) return { ...DEFAULT_VOICE_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<VoiceSettings>;
     return {
-      noiseSuppression: parsed.noiseSuppression ?? true,
+      noiseSuppression: readNoiseSuppression(parsed.noiseSuppression),
+      noiseGate: clamp(
+        typeof parsed.noiseGate === "number"
+          ? parsed.noiseGate
+          : DEFAULT_VOICE_SETTINGS.noiseGate,
+        GATE_OFF_DB,
+        -20
+      ),
       echoCancellation: parsed.echoCancellation ?? true,
       autoGainControl: parsed.autoGainControl ?? true,
       inputGain: clamp(
@@ -90,6 +126,8 @@ export function writeVoiceSettings(partial: Partial<VoiceSettings>): VoiceSettin
   };
   next.inputGain = clamp(next.inputGain, 0.5, 2);
   next.outputVolume = clamp(next.outputVolume, 0, 1);
+  next.noiseSuppression = readNoiseSuppression(next.noiseSuppression);
+  next.noiseGate = clamp(next.noiseGate, GATE_OFF_DB, -20);
   if (typeof next.outputDeviceId !== "string") next.outputDeviceId = "";
   if (!isVideoQuality(next.videoQuality)) next.videoQuality = "medium";
   localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
@@ -111,7 +149,7 @@ export function buildAudioConstraints(
   settings: VoiceSettings = readVoiceSettings()
 ): MediaTrackConstraints {
   const c: MediaTrackConstraints = {
-    noiseSuppression: settings.noiseSuppression,
+    noiseSuppression: settings.noiseSuppression !== "off",
     echoCancellation: settings.echoCancellation,
     autoGainControl: settings.autoGainControl,
   };
@@ -163,7 +201,7 @@ export async function applyVoiceProcessing(
   if (track.kind !== "audio") return;
   try {
     await track.applyConstraints({
-      noiseSuppression: settings.noiseSuppression,
+      noiseSuppression: settings.noiseSuppression !== "off",
       echoCancellation: settings.echoCancellation,
       autoGainControl: settings.autoGainControl,
     });

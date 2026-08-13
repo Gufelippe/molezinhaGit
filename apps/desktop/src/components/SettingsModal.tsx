@@ -36,10 +36,14 @@ import {
   buildAudioConstraints,
   readVoiceSettings,
   writeVoiceSettings,
+  GATE_OFF_DB,
+  NOISE_SUPPRESSION_OPTIONS,
   VIDEO_QUALITY_OPTIONS,
+  type NoiseSuppressionMode,
   type VideoQuality,
   type VoiceSettings,
 } from "../lib/voiceSettings";
+import { createVoiceChain } from "../lib/audioChain";
 import {
   ensureNotificationPermission,
   readNotifyPrefs,
@@ -448,13 +452,19 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: buildAudioConstraints(micId || undefined, voicePrefs),
       });
+      const raw = stream.getAudioTracks()[0];
+      // Monitor exactly what the call would send, so the meter shows the gate
+      // closing on keyboard noise.
+      const chain = raw ? await createVoiceChain(raw, voicePrefs).catch(() => null) : null;
       const ctx = new AudioContext();
       await ctx.resume().catch(() => undefined);
-      const source = ctx.createMediaStreamSource(stream);
+      const source = ctx.createMediaStreamSource(
+        chain ? new MediaStream([chain.track]) : stream
+      );
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
       const gain = ctx.createGain();
-      gain.gain.value = voicePrefs.inputGain;
+      gain.gain.value = chain ? 1 : voicePrefs.inputGain;
       source.connect(gain);
       gain.connect(analyser);
       // Monitor locally so the user can hear themselves during the test
@@ -485,6 +495,7 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
         cancelAnimationFrame(raf);
         monitor.pause();
         monitor.srcObject = null;
+        chain?.close();
         stream.getTracks().forEach((t) => t.stop());
         void ctx.close();
         setMicTesting(false);
@@ -982,12 +993,47 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
             <h3 className="settings-subhead settings-subhead-flush">
               Processamento de áudio
             </h3>
-            <div className="voice-toggles">
-              <NeoToggle
-                checked={voicePrefs.noiseSuppression}
-                onChange={(v) => patchVoice({ noiseSuppression: v })}
-                label="Supressão de ruído"
+            <div className="field">
+              <label>Supressão de ruído</label>
+              <NeoSelect
+                aria-label="Supressão de ruído"
+                value={voicePrefs.noiseSuppression}
+                options={NOISE_SUPPRESSION_OPTIONS.map((o) => ({
+                  value: o.value,
+                  label: o.label,
+                }))}
+                onChange={(v) =>
+                  patchVoice({ noiseSuppression: v as NoiseSuppressionMode })
+                }
               />
+              <p className="muted field-note">
+                No modo forte o áudio passa por uma IA que remove teclado, cliques e
+                estalos sem cortar a voz. Usa um pouco mais de CPU.
+              </p>
+            </div>
+            <div className="field">
+              <label>
+                Corte de ruído de fundo{" "}
+                {voicePrefs.noiseGate <= GATE_OFF_DB
+                  ? "(desligado)"
+                  : `(${voicePrefs.noiseGate} dB)`}
+              </label>
+              <NeoRange
+                min={GATE_OFF_DB}
+                max={-20}
+                step={5}
+                value={voicePrefs.noiseGate}
+                aria-label="Corte de ruído de fundo"
+                onChange={(v) => patchVoice({ noiseGate: v })}
+              />
+              <p className="muted field-note">
+                Silencia tudo abaixo desse nível quando você não está falando. Mais
+                para a direita corta mais; se sua voz sumir no começo das frases,
+                puxe para a esquerda.
+              </p>
+            </div>
+
+            <div className="voice-toggles">
               <NeoToggle
                 checked={voicePrefs.echoCancellation}
                 onChange={(v) => patchVoice({ echoCancellation: v })}
