@@ -6,6 +6,9 @@ interface Props {
   label: string;
   placeholder?: string;
   confirmLabel?: string;
+  /** Allow confirming with an empty field (optional reason, etc.). */
+  allowEmpty?: boolean;
+  danger?: boolean;
   onClose: () => void;
   onConfirm: (value: string) => void;
 }
@@ -16,6 +19,8 @@ export function PromptModal({
   label,
   placeholder,
   confirmLabel = "Confirmar",
+  allowEmpty = false,
+  danger = false,
   onClose,
   onConfirm,
 }: Props) {
@@ -45,7 +50,7 @@ export function PromptModal({
         onSubmit={(e) => {
           e.preventDefault();
           const trimmed = value.trim();
-          if (!trimmed) return;
+          if (!allowEmpty && !trimmed) return;
           onConfirm(trimmed);
           onClose();
         }}
@@ -66,7 +71,11 @@ export function PromptModal({
           <button type="button" className="neo-btn" onClick={onClose}>
             Cancelar
           </button>
-          <button type="submit" className="neo-btn neo-btn-primary" disabled={!value.trim()}>
+          <button
+            type="submit"
+            className={`neo-btn ${danger ? "neo-btn-danger" : "neo-btn-primary"}`}
+            disabled={!allowEmpty && !value.trim()}
+          >
             {confirmLabel}
           </button>
         </div>

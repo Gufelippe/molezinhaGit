@@ -25,7 +25,14 @@ type AuditRow = {
   actor?: Pick<Profile, "display_name" | "username"> | null;
 };
 
-type Section = "members" | "branding" | "channels" | "invites" | "audit" | "danger";
+type BanRow = {
+  user_id: string;
+  reason: string | null;
+  created_at: string;
+  profiles: Pick<Profile, "display_name" | "username" | "avatar_url"> | null;
+};
+
+type Section = "members" | "bans" | "branding" | "channels" | "invites" | "audit" | "danger";
 
 export type GroupBrandingPatch = {
   icon_url?: string | null;
@@ -72,6 +79,12 @@ export function GroupSettingsModal({
 }: Props) {
   const [section, setSection] = useState<Section>("members");
   const [members, setMembers] = useState<MemberRow[]>([]);
+  const [bans, setBans] = useState<BanRow[]>([]);
+  const [moderation, setModeration] = useState<{
+    userId: string;
+    name: string;
+    ban: boolean;
+  } | null>(null);
   const [audit, setAudit] = useState<AuditRow[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -112,6 +125,38 @@ export function GroupSettingsModal({
         return {
           user_id: raw.user_id,
           role: raw.role,
+          profiles: Array.isArray(p) ? p[0] ?? null : p,
+        };
+      })
+    );
+  }, [groupId]);
+
+  const loadBans = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("group_bans")
+      .select("user_id, reason, created_at, profiles:user_id(display_name, username, avatar_url)")
+      .eq("group_id", groupId)
+      .order("created_at", { ascending: false });
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+    setBans(
+      (data ?? []).map((row) => {
+        const raw = row as unknown as {
+          user_id: string;
+          reason: string | null;
+          created_at: string;
+          profiles:
+            | Pick<Profile, "display_name" | "username" | "avatar_url">
+            | Pick<Profile, "display_name" | "username" | "avatar_url">[]
+            | null;
+        };
+        const p = raw.profiles;
+        return {
+          user_id: raw.user_id,
+          reason: raw.reason,
+          created_at: raw.created_at,
           profiles: Array.isArray(p) ? p[0] ?? null : p,
         };
       })
@@ -181,13 +226,16 @@ export function GroupSettingsModal({
   useEffect(() => {
     if (!open) return;
     void loadMembers();
-    if (isStaff) void loadAudit();
+    if (isStaff) {
+      void loadAudit();
+      void loadBans();
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, loadMembers, loadAudit, isStaff, onClose]);
+  }, [open, loadMembers, loadAudit, loadBans, isStaff, onClose]);
 
   useEffect(() => {
     if (privacyChannel) void loadChannelAccess(privacyChannel.id);
@@ -210,6 +258,49 @@ export function GroupSettingsModal({
     }
     setStatus(role === "admin" ? "Membro promovido a admin." : "Admin removido.");
     await loadMembers();
+    await loadAudit();
+  }
+
+  function canModerate(targetRole: MemberRow["role"]) {
+    if (myRole === "owner") return targetRole !== "owner";
+    if (myRole === "admin") return targetRole === "member";
+    return false;
+  }
+
+  async function moderateMember(userId: string, ban: boolean, reason: string) {
+    setBusy(true);
+    setStatus(null);
+    const { error } = await supabase.rpc("remove_group_member", {
+      p_group_id: groupId,
+      p_user_id: userId,
+      p_ban: ban,
+      p_reason: reason || null,
+    });
+    setBusy(false);
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+    setStatus(ban ? "Membro banido." : "Membro expulso.");
+    await loadMembers();
+    await loadAudit();
+    if (ban) await loadBans();
+  }
+
+  async function unbanMember(userId: string) {
+    setBusy(true);
+    setStatus(null);
+    const { error } = await supabase.rpc("unban_group_member", {
+      p_group_id: groupId,
+      p_user_id: userId,
+    });
+    setBusy(false);
+    if (error) {
+      setStatus(error.message);
+      return;
+    }
+    setStatus("Banimento removido.");
+    await loadBans();
     await loadAudit();
   }
 
@@ -421,6 +512,17 @@ export function GroupSettingsModal({
     if (row.action === "invite_regenerated") {
       return `${actor} regenerou o convite`;
     }
+    if (row.action === "kicked") {
+      const reason = row.meta?.reason ? ` — ${String(row.meta.reason)}` : "";
+      return `${actor} expulsou um membro${reason}`;
+    }
+    if (row.action === "banned") {
+      const reason = row.meta?.reason ? ` — ${String(row.meta.reason)}` : "";
+      return `${actor} baniu um membro${reason}`;
+    }
+    if (row.action === "unbanned") {
+      return `${actor} removeu um banimento`;
+    }
     return `${actor}: ${row.action}`;
   }
 
@@ -442,6 +544,11 @@ export function GroupSettingsModal({
             <button type="button" className={section === "members" ? "active" : ""} onClick={() => setSection("members")}>
               Membros
             </button>
+            {isStaff && (
+              <button type="button" className={section === "bans" ? "active" : ""} onClick={() => setSection("bans")}>
+                Banidos
+              </button>
+            )}
             {isStaff && (
               <button type="button" className={section === "branding" ? "active" : ""} onClick={() => setSection("branding")}>
                 Identidade
@@ -478,6 +585,7 @@ export function GroupSettingsModal({
           <div className="settings-top">
             <h2>
               {section === "members" && "Membros"}
+              {section === "bans" && "Banidos"}
               {section === "branding" && "Identidade"}
               {section === "channels" && "Canais"}
               {section === "invites" && "Convites"}
@@ -506,16 +614,82 @@ export function GroupSettingsModal({
                     <span className="user-panel-handle muted">@{m.profiles?.username}</span>
                   </div>
                   <span className={`role-badge ${m.role}`}>{m.role}</span>
-                  {isOwner && m.role === "member" && (
-                    <button className="neo-btn" type="button" disabled={busy} onClick={() => void setRole(m.user_id, "admin")}>
-                      Tornar admin
-                    </button>
-                  )}
-                  {isOwner && m.role === "admin" && (
-                    <button className="neo-btn neo-btn-danger" type="button" disabled={busy} onClick={() => void setRole(m.user_id, "member")}>
-                      Remover admin
-                    </button>
-                  )}
+                  <div className="member-mod-actions">
+                    {isOwner && m.role === "member" && (
+                      <button className="neo-btn neo-btn-compact" type="button" disabled={busy} onClick={() => void setRole(m.user_id, "admin")}>
+                        Tornar admin
+                      </button>
+                    )}
+                    {isOwner && m.role === "admin" && (
+                      <button className="neo-btn neo-btn-compact neo-btn-danger" type="button" disabled={busy} onClick={() => void setRole(m.user_id, "member")}>
+                        Remover admin
+                      </button>
+                    )}
+                    {isStaff && canModerate(m.role) && (
+                      <>
+                        <button
+                          className="neo-btn neo-btn-compact"
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            setModeration({
+                              userId: m.user_id,
+                              name: m.profiles?.display_name ?? "membro",
+                              ban: false,
+                            })
+                          }
+                        >
+                          Expulsar
+                        </button>
+                        <button
+                          className="neo-btn neo-btn-compact neo-btn-danger"
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            setModeration({
+                              userId: m.user_id,
+                              name: m.profiles?.display_name ?? "membro",
+                              ban: true,
+                            })
+                          }
+                        >
+                          Banir
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {section === "bans" && isStaff && (
+            <div className="settings-section">
+              {bans.length === 0 && (
+                <p className="muted">Ninguém está banido neste servidor.</p>
+              )}
+              {bans.map((b) => (
+                <div key={b.user_id} className="user-panel person-row">
+                  <Avatar
+                    size="sm"
+                    name={b.profiles?.display_name ?? "?"}
+                    url={b.profiles?.avatar_url}
+                    id={b.user_id}
+                  />
+                  <div className="user-panel-identity">
+                    <span className="user-panel-name">{b.profiles?.display_name ?? "Usuário"}</span>
+                    <span className="user-panel-handle muted">
+                      {b.reason ? b.reason : `@${b.profiles?.username ?? ""}`}
+                    </span>
+                  </div>
+                  <button
+                    className="neo-btn neo-btn-compact"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void unbanMember(b.user_id)}
+                  >
+                    Desbanir
+                  </button>
                 </div>
               ))}
             </div>
@@ -847,6 +1021,22 @@ export function GroupSettingsModal({
         </section>
       </div>
 
+      <PromptModal
+        open={Boolean(moderation)}
+        title={moderation?.ban ? `Banir ${moderation.name}?` : `Expulsar ${moderation?.name}?`}
+        label="Motivo (opcional)"
+        placeholder="ex: flood no chat"
+        confirmLabel={moderation?.ban ? "Banir" : "Expulsar"}
+        allowEmpty
+        danger={Boolean(moderation?.ban)}
+        onClose={() => setModeration(null)}
+        onConfirm={(reason) => {
+          if (!moderation) return;
+          const { userId, ban } = moderation;
+          setModeration(null);
+          void moderateMember(userId, ban, reason);
+        }}
+      />
       <PromptModal
         open={channelPrompt === "text"}
         title="Novo canal de texto"

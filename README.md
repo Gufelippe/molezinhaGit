@@ -31,6 +31,8 @@ supabase/         # migrations SQL + RLS
    - `20260326220000_phase2_4_social.sql` — enquetes, identidade do grupo
    - `20260326230000_bugfixes_realtime_invite.sql`
    - `20260327000000_storage_profile_media.sql` — políticas de upload de avatar/banner
+   - `20260327100000_storage_stickers.sql` — políticas de upload de figurinhas
+   - `20260327110000_group_moderation.sql` — expulsar e banir membros
 
    Pular alguma quebra features silenciosamente — o erro `new row violates row-level security policy` ao salvar o perfil é sinal de que as políticas de storage não estão aplicadas.
 2. Em **Authentication → Providers → Email**:

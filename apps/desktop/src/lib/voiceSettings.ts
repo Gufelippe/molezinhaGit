@@ -184,6 +184,28 @@ export function buildScreenConstraints(
   };
 }
 
+/**
+ * System / tab audio that rides along with a screen share. Voice processing
+ * (AEC, RNNoise, gate) would mangle music and games, so it stays off.
+ * `systemAudio: "include"` is Chromium's hint to offer "share system audio"
+ * when capturing a whole screen on Windows.
+ */
+export type DisplayCaptureOptions = DisplayMediaStreamOptions & {
+  systemAudio?: "include" | "exclude";
+};
+
+export function buildDisplayMediaOptions(
+  settings: VoiceSettings = readVoiceSettings()
+): DisplayCaptureOptions {
+  return {
+    video: buildScreenConstraints(settings),
+    // Boolean `true` is what Chromium uses to show the system/tab audio checkbox.
+    // Extra processing constraints here can hide that option on some WebViews.
+    audio: true,
+    systemAudio: "include",
+  };
+}
+
 /** Encoding bitrate cap handed to mediasoup on produce. */
 export function videoBitrate(
   source: "camera" | "screen",

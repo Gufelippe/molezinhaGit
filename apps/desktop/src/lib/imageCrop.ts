@@ -13,7 +13,7 @@ export type CropTarget = {
 
 /** Output sizes stay under the `maxSide` of the matching media limit. */
 export const CROP_TARGETS: Record<
-  Extract<MediaKind, "avatar" | "banner" | "groupIcon" | "groupWallpaper">,
+  Extract<MediaKind, "avatar" | "banner" | "groupIcon" | "groupWallpaper" | "sticker">,
   CropTarget
 > = {
   avatar: {
@@ -43,6 +43,13 @@ export const CROP_TARGETS: Record<
     shape: "rect",
     title: "Ajustar papel de parede",
     hint: "Arraste para escolher o enquadramento.",
+  },
+  sticker: {
+    width: 320,
+    height: 320,
+    shape: "rect",
+    title: "Ajustar figurinha",
+    hint: "Enquadre em 320×320 — o arquivo é compactado sozinho.",
   },
 };
 

@@ -6,6 +6,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { CROP_TARGETS, cropImageToFile, type CropKind } from "../lib/imageCrop";
 import { NeoRange } from "./NeoControls";
 
@@ -193,7 +194,7 @@ export function ImageCropModal({ open, file, kind, onCancel, onConfirm }: Props)
     }
   }
 
-  return (
+  return createPortal(
     <div className="settings-overlay settings-overlay-modal" onClick={onCancel}>
       <div className="neo-outset crop-modal" onClick={(e) => e.stopPropagation()}>
         <h2 className="crop-title">{target.title}</h2>
@@ -255,6 +256,7 @@ export function ImageCropModal({ open, file, kind, onCancel, onConfirm }: Props)
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

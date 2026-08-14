@@ -139,8 +139,18 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
     setStatus(null);
     const next = !sharing;
     try {
-      if (next) await callClient.startScreenShare();
-      else await callClient.stopScreenShare();
+      if (next) {
+        await callClient.startScreenShare();
+        const captured = callClient.getMediaState().screenStream;
+        const hasAudio = captured?.getAudioTracks().some((t) => t.readyState === "live");
+        if (captured && !hasAudio) {
+          setStatus(
+            "Tela compartilhada sem áudio. Marque «Compartilhar áudio do sistema» e escolha a tela inteira, não uma janela."
+          );
+        }
+      } else {
+        await callClient.stopScreenShare();
+      }
     } catch {
       setStatus(next ? "Não foi possível compartilhar a tela." : "Não foi possível parar o compartilhamento.");
     } finally {
@@ -238,11 +248,12 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
 
   return (
     <div
-      className="call-ui"
+      className={`call-ui${hasStage ? " call-ui-staged" : ""}`}
       onPointerDownCapture={() => {
         kickRemoteAudioPlayback();
       }}
     >
+      {screenStream && <ScreenShareSink stream={screenStream} />}
       <div className="call-stage-row">
         <div className="call-media">
           {hasStage && (
@@ -273,6 +284,13 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
           {musicPeers.map((peer) => (
             <MusicAudio key={peer.peerId} peer={peer} />
           ))}
+          {/* Screen-share audio must live outside the tile: compact view can hide
+              the strip, and a muted <video> never plays the captured track. */}
+          {humanPeers
+            .filter((peer) => peer.screenStream)
+            .map((peer) => (
+              <ScreenShareAudio key={`${peer.peerId}:screen-audio`} peer={peer} />
+            ))}
         </div>
 
         <aside className="call-side" aria-label="Quem está na call">
@@ -567,9 +585,6 @@ function LocalScreenTile({
     if (!el) return;
     el.srcObject = stream;
     void el.play().catch(() => undefined);
-    return () => {
-      el.srcObject = null;
-    };
   }, [stream]);
 
   return (
@@ -587,6 +602,70 @@ function LocalScreenTile({
     >
       <video ref={videoRef} autoPlay muted playsInline />
     </TileShell>
+  );
+}
+
+function ScreenShareAudio({ peer }: { peer: RemotePeerMedia }) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const liveAudioTracks =
+    peer.screenStream?.getAudioTracks().filter((t) => t.readyState === "live") ?? [];
+  const audioTrackIds = liveAudioTracks.map((t) => t.id).join(",");
+
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (liveAudioTracks.length > 0) {
+      el.srcObject = new MediaStream(liveAudioTracks);
+      el.muted = false;
+      el.volume = getOutputVolume();
+      void applyAudioOutput(el);
+      void el.play().catch((err) => console.warn("[call] screen audio play failed", err));
+    } else {
+      el.srcObject = null;
+    }
+  }, [peer.screenStream, audioTrackIds]);
+
+  useEffect(() => {
+    return onVoiceSettingsChange((s) => {
+      const el = audioRef.current;
+      if (!el) return;
+      el.volume = s.outputVolume;
+      void applyAudioOutput(el, s.outputDeviceId);
+    });
+  }, []);
+
+  return (
+    <audio
+      ref={audioRef}
+      className="call-remote-audio"
+      autoPlay
+      playsInline
+      aria-hidden
+    />
+  );
+}
+
+function ScreenShareSink({ stream }: { stream: MediaStream }) {
+  const ref = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.srcObject = stream;
+    void el.play().catch(() => undefined);
+  }, [stream]);
+
+  // Must stay mounted and not `display:none` while sharing. Chromium ends a
+  // getDisplayMedia track when no element is rendering it.
+  return (
+    <video
+      ref={ref}
+      className="call-screen-sink"
+      autoPlay
+      muted
+      playsInline
+      aria-hidden
+    />
   );
 }
 
@@ -728,8 +807,9 @@ function RemoteScreenTile({
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
-    if (screen) {
-      el.srcObject = screen;
+    const videoTracks = screen?.getVideoTracks().filter((t) => t.readyState === "live") ?? [];
+    if (videoTracks.length > 0) {
+      el.srcObject = new MediaStream(videoTracks);
       void el.play().catch((err) => console.warn("[call] remote screen play failed", err));
     } else {
       el.srcObject = null;

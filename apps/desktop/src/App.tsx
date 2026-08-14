@@ -195,6 +195,11 @@ export default function App() {
   const [voiceChannel, setVoiceChannel] = useState<Channel | null>(null);
   const [joiningVoice, setJoiningVoice] = useState(false);
   const [promptKind, setPromptKind] = useState<"create" | "addFriend" | null>(null);
+  const [memberModeration, setMemberModeration] = useState<{
+    userId: string;
+    name: string;
+    ban: boolean;
+  } | null>(null);
   const [friendIds, setFriendIds] = useState<Set<string>>(new Set());
   const [friends, setFriends] = useState<Profile[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
@@ -553,6 +558,51 @@ export default function App() {
       void supabase.removeChannel(channel);
     };
   }, [user, loadFriends, loadFriendRequests, loadDmRecents]);
+
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`membership-self:${user.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "group_members",
+          filter: `user_id=eq.${user.id}`,
+        },
+        (payload) => {
+          const groupId = (payload.old as { group_id?: string } | undefined)?.group_id;
+          if (!groupId) return;
+          const groupName =
+            groupsRef.current.find((g) => g.id === groupId)?.name ?? "um servidor";
+          setGroups((prev) => prev.filter((g) => g.id !== groupId));
+          if (activeGroupId === groupId) {
+            setGroupSettingsOpen(false);
+            setMemberPopoutId(null);
+            setActiveGroupId(null);
+            setChannels([]);
+            setMembers([]);
+            setView({ kind: "home" });
+          }
+          if (inVoice && voiceChannel?.group_id === groupId) {
+            void callClient.leave();
+            setInVoice(false);
+            setVoiceChannel(null);
+          }
+          pushToast({
+            kind: "channel",
+            title: "Removido do servidor",
+            body: `Você não faz mais parte de ${groupName}.`,
+            onOpen: () => undefined,
+          });
+        }
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [user, activeGroupId, inVoice, voiceChannel, pushToast]);
 
   useEffect(() => {
     return () => {
@@ -1980,6 +2030,28 @@ export default function App() {
 
   const isStaff = myRole === "owner" || myRole === "admin";
 
+  function canModerateMember(targetRole?: string) {
+    if (myRole === "owner") return targetRole !== "owner";
+    if (myRole === "admin") return targetRole === "member";
+    return false;
+  }
+
+  async function moderateMemberFromPopout(userId: string, ban: boolean, reason: string) {
+    if (!activeGroupId) return;
+    const { error } = await supabase.rpc("remove_group_member", {
+      p_group_id: activeGroupId,
+      p_user_id: userId,
+      p_ban: ban,
+      p_reason: reason || null,
+    });
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    setMembers((prev) => prev.filter((m) => m.id !== userId));
+    setMemberPopoutId(null);
+  }
+
   const toggleReaction = useCallback(
     async (message: Message, emoji: string) => {
       if (!user) return;
@@ -3243,6 +3315,38 @@ export default function App() {
                         Adicionar amigo
                       </button>
                     )}
+                    {isStaff && canModerateMember(popMember.role) && (
+                      <div className="stack-row popout-actions">
+                        <button
+                          type="button"
+                          className="neo-btn neo-btn-grow"
+                          onClick={() => {
+                            setMemberPopoutId(null);
+                            setMemberModeration({
+                              userId: popMember.id,
+                              name: popMember.display_name,
+                              ban: false,
+                            });
+                          }}
+                        >
+                          Expulsar
+                        </button>
+                        <button
+                          type="button"
+                          className="neo-btn neo-btn-danger neo-btn-grow"
+                          onClick={() => {
+                            setMemberPopoutId(null);
+                            setMemberModeration({
+                              userId: popMember.id,
+                              name: popMember.display_name,
+                              ban: true,
+                            });
+                          }}
+                        >
+                          Banir
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ) : null
               }
@@ -3319,6 +3423,26 @@ export default function App() {
         confirmLabel="Enviar pedido"
         onClose={() => setPromptKind(null)}
         onConfirm={(username) => void addFriendById(username)}
+      />
+      <PromptModal
+        open={Boolean(memberModeration)}
+        title={
+          memberModeration?.ban
+            ? `Banir ${memberModeration.name}?`
+            : `Expulsar ${memberModeration?.name}?`
+        }
+        label="Motivo (opcional)"
+        placeholder="ex: flood no chat"
+        confirmLabel={memberModeration?.ban ? "Banir" : "Expulsar"}
+        allowEmpty
+        danger={Boolean(memberModeration?.ban)}
+        onClose={() => setMemberModeration(null)}
+        onConfirm={(reason) => {
+          if (!memberModeration) return;
+          const { userId, ban } = memberModeration;
+          setMemberModeration(null);
+          void moderateMemberFromPopout(userId, ban, reason);
+        }}
       />
       <ForwardDestinationModal
         open={Boolean(forwardSource)}

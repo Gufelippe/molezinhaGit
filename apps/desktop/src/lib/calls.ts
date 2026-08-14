@@ -10,7 +10,7 @@ import { createVoiceChain, type VoiceChain } from "./audioChain";
 import {
   applyVoiceProcessing,
   buildAudioConstraints,
-  buildScreenConstraints,
+  buildDisplayMediaOptions,
   buildVideoConstraints,
   onVoiceSettingsChange,
   readVoiceSettings,
@@ -25,7 +25,7 @@ export interface RemotePeerMedia {
   displayName: string;
   /** Mic + camera tracks. */
   stream: MediaStream;
-  /** Screen share video, when the peer is sharing. */
+  /** Screen share video + optional system/tab audio, when the peer is sharing. */
   screenStream: MediaStream | null;
   audioMuted: boolean;
   videoMuted: boolean;
@@ -60,6 +60,7 @@ export class CallClient {
   private audioProducer: msTypes.Producer | null = null;
   private videoProducer: msTypes.Producer | null = null;
   private screenProducer: msTypes.Producer | null = null;
+  private screenAudioProducer: msTypes.Producer | null = null;
   private peers = new Map<string, RemotePeerMedia>();
   private peerNames = new Map<string, string>();
   private pending = new Map<string, (msg: CallServerMessage) => void>();
@@ -693,6 +694,26 @@ export class CallClient {
     });
   }
 
+  private async produceScreenAudio(track: MediaStreamTrack) {
+    if (!this.sendTransport) throw new Error("Call ainda não está pronta");
+    return this.sendTransport.produce({
+      track,
+      codecOptions: { opusStereo: true, opusFec: true },
+      appData: { source: "screen" as const },
+    });
+  }
+
+  private closeLocalProducer(producer: msTypes.Producer | null) {
+    if (!producer || producer.closed) return;
+    const producerId = producer.id;
+    try {
+      producer.close();
+    } catch {
+      /* ignore */
+    }
+    this.send({ type: "closeProducer", producerId });
+  }
+
   private async createTransport(direction: "send" | "recv") {
     const createdPromise = this.waitFor(
       "transportCreated",
@@ -825,6 +846,19 @@ export class CallClient {
           .some((t) => t.readyState === "live");
         if (hasCamera) resolvedSource = "screen";
       }
+
+      // Same idea for screen audio: mic is already on `peer.stream`, so a second
+      // live audio track from a peer who is sharing is the display capture.
+      if (kind === "audio" && resolvedSource !== "screen" && resolvedSource !== "music") {
+        const existing = this.peers.get(peerId);
+        const hasMic = existing?.stream
+          .getAudioTracks()
+          .some((t) => t.readyState === "live");
+        const hasScreenVideo = existing?.screenStream
+          ?.getVideoTracks()
+          .some((t) => t.readyState === "live");
+        if (hasMic && hasScreenVideo) resolvedSource = "screen";
+      }
       if (!consumed.appData?.source) {
         console.warn(
           "[call] producer without appData.source — peer or server is outdated",
@@ -954,20 +988,26 @@ export class CallClient {
     return Boolean(this.screenProducer && !this.screenProducer.closed);
   }
 
-  /** Capture a screen / window and publish it as a second video producer. */
+  /** Capture a screen / window and publish video plus optional system/tab audio. */
   async startScreenShare() {
     if (this.screenSharing) return;
     if (!this.sendTransport) throw new Error("Call ainda não está pronta");
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: buildScreenConstraints(),
-        audio: false,
-      });
+      stream = await navigator.mediaDevices.getDisplayMedia(buildDisplayMediaOptions());
     } catch (err) {
-      // User cancelled the picker — not an error worth surfacing.
+      // Extra Chromium fields (`systemAudio`) can throw on some WebViews.
+      // Retry with a plain audio+video request before giving up.
       if (err instanceof DOMException && err.name === "NotAllowedError") return;
-      throw err;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: buildDisplayMediaOptions().video,
+          audio: true,
+        });
+      } catch (retryErr) {
+        if (retryErr instanceof DOMException && retryErr.name === "NotAllowedError") return;
+        throw retryErr;
+      }
     }
     const track = stream.getVideoTracks()[0];
     if (!track) {
@@ -989,23 +1029,43 @@ export class CallClient {
       this.emit();
       throw err;
     }
+    await this.produceScreenAudioFrom(stream);
     this.emit();
   }
 
+  private async produceScreenAudioFrom(stream: MediaStream) {
+    const audioTrack = stream.getAudioTracks().find((t) => t.readyState === "live");
+    if (!audioTrack || !this.sendTransport) return;
+    if ("contentHint" in audioTrack) audioTrack.contentHint = "music";
+    try {
+      await audioTrack.applyConstraints({
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+    } catch {
+      /* some capture surfaces reject these */
+    }
+    audioTrack.addEventListener("ended", () => {
+      this.closeLocalProducer(this.screenAudioProducer);
+      this.screenAudioProducer = null;
+    });
+    try {
+      this.screenAudioProducer = await this.produceScreenAudio(audioTrack);
+    } catch (err) {
+      console.warn("[call] screen audio produce failed", err);
+    }
+  }
+
   async stopScreenShare() {
-    const producer = this.screenProducer;
+    const videoProducer = this.screenProducer;
+    const audioProducer = this.screenAudioProducer;
     this.screenProducer = null;
+    this.screenAudioProducer = null;
     const stream = this.screenStream;
     this.screenStream = null;
-    if (producer && !producer.closed) {
-      const producerId = producer.id;
-      try {
-        producer.close();
-      } catch {
-        /* ignore */
-      }
-      this.send({ type: "closeProducer", producerId });
-    }
+    this.closeLocalProducer(videoProducer);
+    this.closeLocalProducer(audioProducer);
     stream?.getTracks().forEach((t) => {
       try {
         t.stop();
@@ -1050,6 +1110,7 @@ export class CallClient {
     this.audioProducer?.close();
     this.videoProducer?.close();
     this.screenProducer?.close();
+    this.screenAudioProducer?.close();
     for (const consumer of this.consumers.values()) {
       try {
         consumer.close();
@@ -1071,6 +1132,7 @@ export class CallClient {
     this.audioProducer = null;
     this.videoProducer = null;
     this.screenProducer = null;
+    this.screenAudioProducer = null;
     this.sendTransport = null;
     this.recvTransport = null;
     this.device = null;
@@ -1105,6 +1167,7 @@ export class CallClient {
     this.teardownAudioPipeline();
     this.videoEnabled = false;
     this.screenProducer = null;
+    this.screenAudioProducer = null;
   }
 
   get activeChannelId() {

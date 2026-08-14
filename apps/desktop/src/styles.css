@@ -2254,9 +2254,22 @@ h3,
   border-bottom: 1px solid color-mix(in srgb, var(--neo-shadow-dark) 25%, transparent);
 }
 
+/* Explicit height so the screen-stage flex child does not collapse to 0
+   (auto-height + flex-basis: 0) and take the capture with it. */
 .call-stage-compact .call-stage-row {
-  flex: 0 1 auto;
-  max-height: 180px;
+  flex: 0 0 168px;
+  height: 168px;
+  max-height: 168px;
+}
+
+.call-stage-compact:has(.call-ui-staged) {
+  max-height: 52%;
+}
+
+.call-stage-compact:has(.call-ui-staged) .call-stage-row {
+  flex: 0 0 220px;
+  height: 220px;
+  max-height: 220px;
 }
 
 .call-stage-compact .call-ui {
@@ -2272,6 +2285,12 @@ h3,
 /* Docked above a chat there is only room for the shared screen. */
 .call-stage-compact .video-grid-strip {
   display: none;
+}
+
+.call-stage-compact .screen-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
 }
 
 .call-ui {
@@ -2711,6 +2730,18 @@ h3,
   overflow: hidden;
 }
 
+/* Keep getDisplayMedia alive when the visible preview is unmounted or 0×0. */
+.call-screen-sink {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 2px;
+  height: 2px;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
 /* Camera-off tiles get a soft spotlight so they read as a seat, not a void. */
 .video-tile-off {
   display: grid;
@@ -2876,6 +2907,7 @@ h3,
   position: fixed;
   width: min(320px, calc(100vw - 2rem));
   z-index: var(--z-popover);
+  isolation: isolate;
   animation: rise-in 0.18s var(--ease);
 }
 
@@ -5636,6 +5668,14 @@ h3,
 .person-row {
   margin-top: 0;
   margin-bottom: var(--sp-2);
+}
+
+.member-mod-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  margin-left: auto;
 }
 
 .friends-section {

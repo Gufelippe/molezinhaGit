@@ -54,7 +54,18 @@ export function InvitePreviewModal({ open, initialCode = "", onClose, onJoined }
     const { data, error } = await supabase.rpc("join_group_by_invite", { p_code: c });
     setBusy(false);
     if (error) {
-      setStatus(error.message);
+      const raw = error.message.toLowerCase();
+      if (raw.includes("banned")) {
+        setStatus("Você está banido deste servidor.");
+      } else if (raw.includes("expired")) {
+        setStatus("Este convite expirou.");
+      } else if (raw.includes("exhausted")) {
+        setStatus("Este convite esgotou os usos.");
+      } else if (raw.includes("invalid")) {
+        setStatus("Convite inválido.");
+      } else {
+        setStatus(error.message);
+      }
       return;
     }
     onJoined(data as string);

@@ -6,6 +6,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+import { createPortal } from "react-dom";
 import type { Profile } from "@molezinha/shared";
 import { ProfileCard } from "./ProfileCard";
 
@@ -96,7 +97,7 @@ export function ProfilePopout({
 
   if (!open || !profile || !pos) return null;
 
-  return (
+  return createPortal(
     <div
       className="user-popout"
       ref={popRef}
@@ -125,6 +126,7 @@ export function ProfilePopout({
         activity={profile.activity}
         footer={footer}
       />
-    </div>
+    </div>,
+    document.body
   );
 }
