@@ -1,6 +1,6 @@
 [package]
 name = "molezinha"
-version = "0.1.6",
+version = "0.1.6"
 description = "molezinha desktop"
 authors = ["molezinha"]
 edition = "2021"
