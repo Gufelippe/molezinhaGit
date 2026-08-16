@@ -62,14 +62,17 @@ export function needsVoiceChain(settings: VoiceSettings) {
  * for resume; if it never runs, the caller must fall back to the raw mic.
  */
 export async function ensureAudioContextRunning(context: AudioContext): Promise<boolean> {
-  if (context.state === "closed") return false;
-  if (context.state === "running") return true;
+  // Read `state` as string after awaits — TS narrows AudioContextState across
+  // resume() and thinks `"running"` is unreachable.
+  const state = () => context.state as string;
+  if (state() === "closed") return false;
+  if (state() === "running") return true;
   try {
     await context.resume();
   } catch {
     /* ignore */
   }
-  if (context.state === "running") return true;
+  if (state() === "running") return true;
   await new Promise<void>((resolve) => {
     const done = () => {
       context.removeEventListener("statechange", onChange);
@@ -77,13 +80,14 @@ export async function ensureAudioContextRunning(context: AudioContext): Promise<
       resolve();
     };
     const onChange = () => {
-      if (context.state === "running" || context.state === "closed") done();
+      const s = state();
+      if (s === "running" || s === "closed") done();
     };
     const timer = window.setTimeout(done, 400);
     context.addEventListener("statechange", onChange);
     void context.resume().catch(() => undefined);
   });
-  return context.state === "running";
+  return state() === "running";
 }
 
 /**
