@@ -21,6 +21,10 @@ export type VoiceChain = {
   /** Processed track to send to the call. */
   track: MediaStreamTrack;
   setGain: (value: number) => void;
+  /** True while the graph is actually producing samples. */
+  isLive: () => boolean;
+  /** Re-kick WebView2 autoplay policy if the context went suspended. */
+  resume: () => Promise<boolean>;
   close: () => void;
 };
 
@@ -52,6 +56,37 @@ export function needsVoiceChain(settings: VoiceSettings) {
 }
 
 /**
+ * WebView2 / Chromium often create AudioContexts as `suspended` when the
+ * constructor runs after an async gap (join handshake). A suspended context
+ * still yields a live MediaStreamTrack — it just carries silence. Wait briefly
+ * for resume; if it never runs, the caller must fall back to the raw mic.
+ */
+export async function ensureAudioContextRunning(context: AudioContext): Promise<boolean> {
+  if (context.state === "closed") return false;
+  if (context.state === "running") return true;
+  try {
+    await context.resume();
+  } catch {
+    /* ignore */
+  }
+  if (context.state === "running") return true;
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      context.removeEventListener("statechange", onChange);
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const onChange = () => {
+      if (context.state === "running" || context.state === "closed") done();
+    };
+    const timer = window.setTimeout(done, 400);
+    context.addEventListener("statechange", onChange);
+    void context.resume().catch(() => undefined);
+  });
+  return context.state === "running";
+}
+
+/**
  * Builds the outgoing mic chain: high-pass → RNNoise → noise gate → gain.
  *
  * The browser suppressor only models stationary noise, so keyboard clicks and
@@ -72,9 +107,13 @@ export async function createVoiceChain(
     latencyHint: "interactive",
   });
   let denoiser: RnnoiseWorkletNode | null = null;
+  let closed = false;
 
   try {
-    await context.resume().catch(() => undefined);
+    if (!(await ensureAudioContextRunning(context))) {
+      throw new Error("AudioContext suspenso — microfone processado sairia mudo");
+    }
+
     const source = context.createMediaStreamSource(new MediaStream([raw]));
 
     const highpass = context.createBiquadFilter();
@@ -90,6 +129,10 @@ export async function createVoiceChain(
     if (settings.noiseSuppression === "strong") {
       try {
         const wasmBinary = await getRnnoiseBinary();
+        // Worklet load can take long enough for autoplay policy to re-suspend.
+        if (!(await ensureAudioContextRunning(context))) {
+          throw new Error("AudioContext suspenso após carregar RNNoise");
+        }
         await context.audioWorklet.addModule(rnnoiseWorkletUrl);
         denoiser = new RnnoiseWorkletNode(context, {
           maxChannels: 1,
@@ -126,15 +169,35 @@ export async function createVoiceChain(
     destination.channelCount = 1;
     gain.connect(destination);
 
+    if (!(await ensureAudioContextRunning(context))) {
+      throw new Error("AudioContext suspenso ao finalizar a cadeia de voz");
+    }
+
     const track = destination.stream.getAudioTracks()[0];
     if (!track) throw new Error("Falha ao processar o áudio do microfone.");
+
+    const resume = async () => {
+      if (closed || context.state === "closed") return false;
+      return ensureAudioContextRunning(context);
+    };
+
+    // Keep trying if the OS / WebView parks the graph mid-call (minimize, sleep).
+    const onStateChange = () => {
+      if (closed || context.state !== "suspended") return;
+      void context.resume().catch(() => undefined);
+    };
+    context.addEventListener("statechange", onStateChange);
 
     return {
       track,
       setGain: (value) => {
         gain.gain.value = value;
       },
+      isLive: () => !closed && context.state === "running",
+      resume,
       close: () => {
+        closed = true;
+        context.removeEventListener("statechange", onStateChange);
         try {
           denoiser?.destroy();
         } catch {

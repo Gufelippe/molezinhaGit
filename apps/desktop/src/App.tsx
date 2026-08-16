@@ -18,6 +18,7 @@ import type {
 import { useAuth } from "./lib/auth";
 import { supabase } from "./lib/supabase";
 import { callClient } from "./lib/calls";
+import { unlockCallSounds } from "./lib/callSounds";
 import { musicApi } from "./lib/musicApi";
 import { socialClient } from "./lib/social";
 import {
@@ -2333,7 +2334,10 @@ export default function App() {
     setError(null);
     try {
       // Unlock WebView2 autoplay while we still have the click gesture.
+      // A fresh AudioContext later (RNNoise) may still start suspended — CallClient
+      // falls back to the raw mic / resumes on the next click inside the call UI.
       try {
+        unlockCallSounds();
         const ctx = new AudioContext();
         await ctx.resume();
         const silent = new Audio(
@@ -2341,6 +2345,7 @@ export default function App() {
         );
         silent.volume = 0.01;
         await silent.play().catch(() => undefined);
+        void ctx.close().catch(() => undefined);
       } catch {
         /* ignore */
       }

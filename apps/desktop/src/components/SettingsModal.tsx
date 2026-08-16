@@ -43,7 +43,7 @@ import {
   type VideoQuality,
   type VoiceSettings,
 } from "../lib/voiceSettings";
-import { createVoiceChain } from "../lib/audioChain";
+import { createVoiceChain, ensureAudioContextRunning } from "../lib/audioChain";
 import {
   ensureNotificationPermission,
   readNotifyPrefs,
@@ -448,37 +448,68 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
     setMicTesting(true);
     setMicLevel(0);
     setStatus(null);
+
+    // Open the meter context on the click gesture — any await (getUserMedia /
+    // RNNoise) can expire WebView2 user-activation and leave a later context mute.
+    const meterCtx = new AudioContext();
+    const meterReady = await ensureAudioContextRunning(meterCtx);
+    if (!meterReady) {
+      void meterCtx.close().catch(() => undefined);
+      setMicTesting(false);
+      setStatus(
+        "Não foi possível iniciar o medidor de áudio. Clique de novo em Testar microfone."
+      );
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: buildAudioConstraints(micId || undefined, voicePrefs),
       });
       const raw = stream.getAudioTracks()[0];
-      // Monitor exactly what the call would send, so the meter shows the gate
-      // closing on keyboard noise.
-      const chain = raw ? await createVoiceChain(raw, voicePrefs).catch(() => null) : null;
-      const ctx = new AudioContext();
-      await ctx.resume().catch(() => undefined);
-      const source = ctx.createMediaStreamSource(
-        chain ? new MediaStream([chain.track]) : stream
-      );
-      const analyser = ctx.createAnalyser();
+      if (!raw) {
+        stream.getTracks().forEach((t) => t.stop());
+        void meterCtx.close().catch(() => undefined);
+        setMicTesting(false);
+        setStatus("Nenhum microfone disponível.");
+        return;
+      }
+
+      // Prefer what the call would send; if the processing graph is mute, meter the raw mic.
+      let activeChain = await createVoiceChain(raw, voicePrefs).catch(() => null);
+      if (activeChain && !activeChain.isLive()) {
+        activeChain.close();
+        activeChain = null;
+      }
+
+      const listenStream = activeChain
+        ? new MediaStream([activeChain.track])
+        : stream;
+
+      const source = meterCtx.createMediaStreamSource(listenStream);
+      const analyser = meterCtx.createAnalyser();
       analyser.fftSize = 256;
-      const gain = ctx.createGain();
-      gain.gain.value = chain ? 1 : voicePrefs.inputGain;
+      const gain = meterCtx.createGain();
+      gain.gain.value = activeChain ? 1 : voicePrefs.inputGain;
       source.connect(gain);
       gain.connect(analyser);
-      // Monitor locally so the user can hear themselves during the test
-      const dest = ctx.createMediaStreamDestination();
-      gain.connect(dest);
+
+      // Play the capture directly — avoids a second MediaStreamDestination that
+      // can also go silent under autoplay policy.
       const monitor = new Audio();
-      monitor.srcObject = dest.stream;
+      monitor.srcObject = listenStream;
       monitor.volume = 0.7;
       void applyAudioOutput(monitor, voicePrefs.outputDeviceId);
-      void monitor.play().catch(() => undefined);
+      await monitor.play().catch(() => undefined);
 
       const data = new Uint8Array(analyser.frequencyBinCount);
       let raf = 0;
+      let peak = 0;
       const tick = () => {
+        void ensureAudioContextRunning(meterCtx);
+        if (activeChain && !activeChain.isLive()) {
+          void activeChain.resume();
+        }
         analyser.getByteTimeDomainData(data);
         let sum = 0;
         for (let i = 0; i < data.length; i++) {
@@ -486,6 +517,7 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
           sum += v * v;
         }
         const rms = Math.sqrt(sum / data.length);
+        peak = Math.max(peak, rms);
         setMicLevel(Math.min(1, rms * 3.2));
         raf = requestAnimationFrame(tick);
       };
@@ -495,18 +527,33 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
         cancelAnimationFrame(raf);
         monitor.pause();
         monitor.srcObject = null;
-        chain?.close();
+        activeChain?.close();
         stream.getTracks().forEach((t) => t.stop());
-        void ctx.close();
+        void meterCtx.close().catch(() => undefined);
         setMicTesting(false);
         setMicLevel(0);
         micTestCleanupRef.current = null;
-        setStatus("Teste de microfone concluído.");
+        if (peak < 0.01) {
+          setStatus(
+            "Quase nenhum áudio no microfone. Troque o dispositivo, desligue o corte de ruído ou confira o volume do Windows."
+          );
+        } else {
+          setStatus(
+            activeChain
+              ? "Teste de microfone concluído."
+              : "Teste ok no mic cru (processamento estava mudo — na call o app também cai pro mic direto)."
+          );
+        }
       };
       micTestCleanupRef.current = stop;
-      setStatus("Falando… veja o nível abaixo (5s).");
+      setStatus(
+        activeChain
+          ? "Falando… veja o nível abaixo (5s)."
+          : "Falando… medindo o mic sem processamento (5s)."
+      );
       window.setTimeout(stop, 5000);
     } catch {
+      void meterCtx.close().catch(() => undefined);
       setMicTesting(false);
       setStatus("Não foi possível acessar o microfone.");
     }

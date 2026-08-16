@@ -44,6 +44,8 @@ function kickRemoteAudioPlayback() {
     void applyAudioOutput(el, settings.outputDeviceId);
     void el.play().catch((err) => console.warn("[call] remote audio play failed", err));
   }
+  // Same gesture unlocks the outgoing RNNoise AudioContext (or falls back to raw mic).
+  void callClient.ensureOutgoingAudioAlive();
 }
 
 function formatElapsed(totalSeconds: number) {

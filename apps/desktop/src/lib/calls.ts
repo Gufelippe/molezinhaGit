@@ -422,7 +422,7 @@ export class CallClient {
       this.videoEnabled = false;
 
       // Privacy: never open the camera on join — only mic unless video is explicitly requested.
-      const micId = localStorage.getItem("molezinha.mic") || undefined;
+      const micId = await this.resolveStoredMicId();
       const camId = localStorage.getItem("molezinha.cam") || undefined;
       const constraints: MediaStreamConstraints = {};
       if (opts.audio) {
@@ -470,6 +470,10 @@ export class CallClient {
           this.audioMuted = true;
           this.send({ type: "mute", kind: "audio", muted: true });
         }
+        // Join handshake is async — the RNNoise context may have parked itself.
+        queueMicrotask(() => {
+          void this.ensureOutgoingAudioAlive();
+        });
       }
 
       if (opts.video) {
@@ -591,9 +595,64 @@ export class CallClient {
    * Chromium locks noise suppression / echo cancellation / AGC at capture time —
    * `applyConstraints` on a live track is a no-op, so re-capture and swap the track.
    */
+  /**
+   * Drop a stale `molezinha.mic` id (reinstalled drivers / unplugged headset)
+   * so we don't soft-pick a silent virtual device via `{ ideal }`.
+   */
+  private async resolveStoredMicId(): Promise<string | undefined> {
+    const stored = localStorage.getItem("molezinha.mic") || "";
+    if (!stored) return undefined;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const stillThere = devices.some(
+        (d) => d.kind === "audioinput" && d.deviceId === stored
+      );
+      if (stillThere) return stored;
+      localStorage.removeItem("molezinha.mic");
+      console.warn("[call] microfone salvo sumiu — usando o padrão do sistema");
+    } catch {
+      /* keep stored id; getUserMedia will soft-fail via ideal */
+    }
+    return undefined;
+  }
+
+  /**
+   * WebView2 parks AudioContexts without a gesture. Call this from UI clicks
+   * so a suspended RNNoise graph starts producing samples again — or swap back
+   * to the raw mic if resume is impossible.
+   */
+  async ensureOutgoingAudioAlive() {
+    const chain = this.voiceChain;
+    if (!chain) return;
+    if (chain.isLive()) return;
+    const resumed = await chain.resume();
+    if (resumed) return;
+    const raw = this.rawMicTrack;
+    const producer = this.audioProducer;
+    if (!raw || raw.readyState !== "live" || !producer || producer.closed) return;
+    console.warn("[call] cadeia de voz muda — enviando o microfone cru");
+    try {
+      chain.close();
+    } catch {
+      /* ignore */
+    }
+    this.voiceChain = null;
+    this.appliedChain = null;
+    raw.enabled = !this.audioMuted;
+    try {
+      await producer.replaceTrack({ track: raw });
+    } catch (err) {
+      console.warn("[call] replaceTrack (fallback mic) failed", err);
+      return;
+    }
+    const otherTracks = this.localStream?.getTracks().filter((t) => t.kind !== "audio") ?? [];
+    this.localStream = new MediaStream([raw, ...otherTracks]);
+    this.emit();
+  }
+
   private async restartMicTrack(settings: VoiceSettings) {
     const producer = this.audioProducer;
-    const micId = localStorage.getItem("molezinha.mic") || undefined;
+    const micId = await this.resolveStoredMicId();
 
     let capture: MediaStream;
     try {
