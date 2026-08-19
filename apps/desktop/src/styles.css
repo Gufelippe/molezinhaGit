@@ -1241,6 +1241,7 @@ h3,
 .group-pill {
   --pill-accent: var(--neo-accent);
   position: relative;
+  overflow: hidden;
   width: 50px;
   height: 50px;
   border-radius: 18px;
@@ -1440,9 +1441,72 @@ h3,
   min-width: 0;
 }
 
-.channel-item-voice-peers {
-  display: block;
-  font-size: var(--text-xs);
+.voice-channel-block {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.15rem;
+}
+
+.voice-channel-members {
+  display: flex;
+  flex-direction: column;
+  padding: 0.1rem 0 0.25rem 1.55rem;
+  gap: 0.05rem;
+}
+
+.voice-channel-member {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.22rem 0.4rem;
+  border: none;
+  border-radius: var(--neo-radius-xs);
+  background: transparent;
+  color: var(--neo-text);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+
+.voice-channel-member:hover,
+.voice-channel-member.active {
+  background: color-mix(in srgb, var(--neo-bg-elevated) 80%, transparent);
+}
+
+.voice-channel-member-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-channel-member.speaking .voice-channel-member-name {
+  color: var(--neo-success);
+}
+
+.voice-channel-member-flags {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-shrink: 0;
+  color: var(--neo-text-muted);
+}
+
+.voice-channel-member-flags .icon {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
+.voice-channel-member-flags .danger {
+  color: var(--neo-danger);
+}
+
+.voice-channel-member-flags .live {
+  color: var(--neo-accent-bright);
 }
 
 .channel-item-name {
@@ -1802,6 +1866,7 @@ h3,
   height: var(--avatar-size);
   border-radius: calc(var(--avatar-size) * 0.34);
   object-fit: cover;
+  overflow: hidden;
   background:
     linear-gradient(
       145deg,
@@ -1840,33 +1905,146 @@ h3,
   --avatar-size: 72px;
 }
 
-/* Presence as a ring hugging the avatar, so status never needs a separate dot. */
-.avatar-ring {
-  box-shadow:
-    4px 4px 10px var(--neo-shadow-dark),
-    -4px -4px 10px var(--neo-shadow-light),
-    0 0 0 2px var(--neo-bg),
-    0 0 0 4px var(--avatar-ring-color, transparent);
+.avatar-wrap {
+  --avatar-size: 40px;
+  position: relative;
+  display: block;
+  width: var(--avatar-size);
+  height: var(--avatar-size);
+  min-width: var(--avatar-size);
+  min-height: var(--avatar-size);
+  max-width: var(--avatar-size);
+  max-height: var(--avatar-size);
+  flex: 0 0 var(--avatar-size);
+  align-self: center;
+  aspect-ratio: 1 / 1;
+  overflow: visible;
+  box-sizing: border-box;
 }
 
-.avatar-ring-online {
-  --avatar-ring-color: var(--neo-success);
+.avatar-wrap-xs { --avatar-size: 22px; }
+.avatar-wrap-sm { --avatar-size: 32px; }
+.avatar-wrap-md { --avatar-size: 40px; }
+.avatar-wrap-lg { --avatar-size: 44px; }
+.avatar-wrap-xl { --avatar-size: 72px; }
+
+.avatar-wrap .avatar {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
 }
 
-.avatar-ring-idle {
-  --avatar-ring-color: #d4a017;
+.avatar-wrap img.avatar {
+  display: block;
 }
 
-.avatar-ring-dnd {
-  --avatar-ring-color: var(--neo-danger);
+.avatar-wrap.speaking .avatar {
+  box-shadow: 0 0 0 2px var(--neo-success);
 }
 
-.avatar-ring-in_call {
-  --avatar-ring-color: var(--neo-accent-bright);
+.avatar-wrap-xl.speaking .avatar {
+  box-shadow: 0 0 0 3px var(--neo-success);
 }
 
-.avatar-ring-offline {
-  --avatar-ring-color: color-mix(in srgb, var(--neo-text-muted) 45%, transparent);
+.avatar-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  z-index: 1;
+  width: 11px;
+  height: 11px;
+  min-width: 11px;
+  min-height: 11px;
+  max-width: 11px;
+  max-height: 11px;
+  aspect-ratio: 1 / 1;
+  border-radius: 50%;
+  border: 3px solid var(--neo-bg);
+  box-sizing: content-box;
+  background: var(--neo-success);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  pointer-events: none;
+  color: #fff;
+}
+
+.avatar-wrap-xs .avatar-badge {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  min-height: 8px;
+  max-width: 8px;
+  max-height: 8px;
+  border-width: 2px;
+  right: -1px;
+  bottom: -1px;
+}
+
+.avatar-wrap-xl .avatar-badge {
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  min-height: 16px;
+  max-width: 16px;
+  max-height: 16px;
+  border-width: 4px;
+}
+
+.avatar-badge-online {
+  background: var(--neo-success);
+}
+
+.avatar-badge-idle {
+  background: #d4a017;
+}
+
+.avatar-badge-dnd {
+  background: var(--neo-danger);
+}
+
+.avatar-badge-dnd::after {
+  content: "";
+  width: 55%;
+  height: 2px;
+  border-radius: 1px;
+  background: #fff;
+}
+
+.avatar-wrap-xs .avatar-badge-dnd::after {
+  height: 1.5px;
+}
+
+.avatar-badge-offline {
+  background: color-mix(in srgb, var(--neo-text-muted) 70%, var(--neo-bg));
+}
+
+.avatar-badge .avatar-call-icon {
+  width: 70%;
+  height: 70%;
+  min-width: 0;
+  min-height: 0;
+  display: block;
+}
+
+.avatar-badge-dnd .avatar-call-icon,
+.avatar-badge-offline .avatar-call-icon {
+  display: none;
+}
+
+.avatar-badge-dnd.has-call::after {
+  display: none;
+}
+
+.avatar-badge.has-call.avatar-badge-dnd .avatar-call-icon,
+.avatar-badge.has-call.avatar-badge-offline .avatar-call-icon {
+  display: block;
 }
 
 .composer {
@@ -2213,25 +2391,24 @@ h3,
    keeps a single tile from sprawling across an ultrawide window. */
 .video-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
-  grid-auto-rows: minmax(140px, 1fr);
-  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 168px), 1fr));
+  grid-auto-rows: minmax(132px, auto);
+  gap: 0.45rem;
   flex: 1;
   min-height: 0;
   width: 100%;
-  max-width: 1080px;
+  max-width: 920px;
   margin-inline: auto;
-  align-content: center;
-  /* `safe` keeps the first row reachable when tiles overflow the stage. */
-  align-content: safe center;
+  align-content: start;
   overflow: auto;
 }
 
-/* Small calls get explicit column counts — auto-fit would stretch two people
-   across an ultrawide window and leave the tiles as thin bands. */
+/* A lone person sits larger and centered; everyone else packs into a denser grid. */
 .video-grid[data-count="1"] {
   grid-template-columns: minmax(0, 1fr);
-  max-width: 880px;
+  max-width: 420px;
+  align-content: center;
+  margin-inline: auto;
 }
 
 .video-grid[data-count="2"],
@@ -2355,7 +2532,7 @@ h3,
 
 /* A shared screen fills the stage instead of obeying the 16:9 tile cap. */
 .screen-stage .video-tile {
-  aspect-ratio: auto;
+  aspect-ratio: 16 / 9;
   align-self: stretch;
   width: 100%;
   max-height: none;
@@ -2692,6 +2869,10 @@ h3,
   background: var(--neo-accent-soft);
 }
 
+.video-tile-screen {
+  aspect-ratio: 16 / 9;
+}
+
 .video-tile-screen video {
   object-fit: contain;
   background: var(--neo-bg-deep);
@@ -2700,11 +2881,10 @@ h3,
 .video-tile {
   position: relative;
   min-height: 0;
-  /* Landscape by construction: a lone tile can't stretch into a tall slab. */
   width: 100%;
-  aspect-ratio: 16 / 9;
+  aspect-ratio: 1 / 1;
   max-height: 100%;
-  align-self: center;
+  align-self: stretch;
   overflow: hidden;
   border-radius: var(--neo-radius);
   background: var(--neo-bg-deep);
@@ -2712,6 +2892,13 @@ h3,
     inset 0 0 0 1px color-mix(in srgb, var(--neo-shadow-light) 28%, transparent),
     5px 5px 14px var(--neo-shadow-dark),
     -5px -5px 14px var(--neo-shadow-light);
+  transition: box-shadow 0.12s var(--ease);
+}
+
+.video-grid[data-count="1"] .video-tile:not(.video-tile-screen) {
+  aspect-ratio: 1 / 1;
+  max-width: 420px;
+  margin-inline: auto;
 }
 
 .video-tile video {
@@ -2760,6 +2947,7 @@ h3,
   align-items: center;
   gap: 0.5rem;
   padding: 0.75rem;
+  overflow: visible;
 }
 
 /* Own camera is a mirror — matches what every other call app does. */
@@ -2905,9 +3093,10 @@ h3,
 
 .user-popout {
   position: fixed;
-  width: min(320px, calc(100vw - 2rem));
+  width: min(340px, calc(100vw - 2rem));
   z-index: var(--z-popover);
   isolation: isolate;
+  overflow: visible;
   animation: rise-in 0.18s var(--ease);
 }
 
@@ -2924,6 +3113,10 @@ h3,
 
 .profile-card-banner {
   height: 96px;
+  overflow: hidden;
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-position: center;
   background:
     linear-gradient(135deg, color-mix(in srgb, var(--neo-accent) 75%, #1a1d24), color-mix(in srgb, var(--neo-accent-soft) 80%, var(--neo-bg)));
   position: relative;
@@ -2965,20 +3158,44 @@ h3,
   position: relative;
   width: 80px;
   height: 80px;
+  min-width: 80px;
+  min-height: 80px;
   margin-top: -40px;
   margin-bottom: 0.55rem;
+  flex-shrink: 0;
+}
+
+.profile-card-avatar-wrap .profile-card-status {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  display: block;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  min-height: 16px;
+  border-radius: 50%;
+  border: 4px solid var(--neo-bg-elevated);
+  box-sizing: content-box;
+  box-shadow: none;
+  z-index: 1;
 }
 
 .profile-card-avatar,
 .profile-card-avatar-fallback {
+  display: block;
   width: 80px;
   height: 80px;
+  min-width: 80px;
+  min-height: 80px;
+  max-width: 80px;
+  max-height: 80px;
+  aspect-ratio: 1 / 1;
   border-radius: 50%;
   object-fit: cover;
   border: 6px solid var(--neo-bg-elevated);
   background: var(--neo-accent-soft);
   box-sizing: border-box;
-  box-shadow: 0 0 0 3px var(--profile-accent);
 }
 
 .profile-card-avatar-fallback {
@@ -3022,14 +3239,7 @@ h3,
 
 /* Needs to outrank the generic .status-dot rule further down the sheet —
    otherwise the 4px ring eats the 9px dot and only a pixel of colour shows. */
-.profile-card-avatar-wrap .profile-card-status {
-  position: absolute;
-  right: 2px;
-  bottom: 2px;
-  width: 18px;
-  height: 18px;
-  border: 4px solid var(--neo-bg-elevated);
-  box-sizing: border-box;
+.profile-card-avatar-wrap .profile-card-status.in-voice {
   box-shadow: none;
 }
 
@@ -3362,12 +3572,17 @@ h3,
 }
 
 .status-dot {
+  display: inline-block;
   width: 9px;
   height: 9px;
+  min-width: 9px;
+  min-height: 9px;
+  aspect-ratio: 1 / 1;
   border-radius: 50%;
   background: var(--neo-success);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--neo-success) 28%, transparent);
   flex-shrink: 0;
+  vertical-align: middle;
 }
 
 .status-dot.idle {
@@ -3386,6 +3601,17 @@ h3,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.member-custom-status {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 550;
+  color: var(--neo-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.88;
 }
 
 .profile-card-activity {
@@ -4289,6 +4515,67 @@ h3,
   background: color-mix(in srgb, var(--neo-shadow-dark) 45%, transparent);
 }
 
+.msg-context-volume {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.4rem 0.55rem 0.55rem;
+}
+
+.msg-context-volume-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--neo-text-muted);
+}
+
+.msg-context-volume input[type="range"] {
+  width: 100%;
+  accent-color: var(--neo-accent);
+}
+
+.status-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin: 0.75rem 0 0.35rem;
+}
+
+.status-picker-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.86rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.status-picker-btn:hover,
+.status-picker-btn.active {
+  background: color-mix(in srgb, var(--neo-accent-soft) 55%, transparent);
+}
+
+.call-ctrl:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.call-ctrl-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--neo-danger);
+}
+
+.call-roster-flag.danger.server {
+  color: var(--neo-danger);
+}
+
 .msg-reply-quote {
   display: flex;
   flex-direction: column;
@@ -4724,6 +5011,7 @@ h3,
 }
 
 .invite-preview-icon {
+  position: relative;
   width: 52px;
   height: 52px;
   flex-shrink: 0;
@@ -4738,6 +5026,8 @@ h3,
 }
 
 .invite-preview-icon img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -4851,10 +5141,17 @@ h3,
   background: var(--neo-bg-deep);
   cursor: zoom-in;
   line-height: 0;
+  max-height: 260px;
+  width: 100%;
+}
+
+.msg-attach-image.has-size {
+  height: auto;
 }
 
 .msg-attach-image img {
   width: 100%;
+  height: 100%;
   max-height: 260px;
   object-fit: cover;
   display: block;
@@ -5617,11 +5914,11 @@ h3,
 }
 
 .popout-cta {
-  margin-top: var(--sp-4);
+  margin-top: 0.75rem;
 }
 
 .popout-actions {
-  margin-top: var(--sp-3);
+  margin-top: 0.55rem;
 }
 
 /* --- identity rows (user panel, members, friends) ------------------------ */
@@ -5740,6 +6037,8 @@ h3,
 }
 
 .group-pill-icon {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   border-radius: inherit;
@@ -5749,16 +6048,17 @@ h3,
 /* --- profile popout extras ---------------------------------------------- */
 
 .popout-extras {
-  margin-top: 0.85rem;
+  margin-top: 0.75rem;
   display: flex;
   flex-direction: column;
+  gap: 0.55rem;
 }
 
 .popout-mutual-list {
   display: flex;
   flex-wrap: wrap;
   gap: 0.3rem;
-  margin-bottom: 0.6rem;
+  margin-bottom: 0;
 }
 
 .popout-mutual-chip {
@@ -5792,8 +6092,11 @@ h3,
 
 .popout-note textarea {
   width: 100%;
-  resize: vertical;
-  font-size: 0.82rem;
+  resize: none;
+  min-height: 4.2em;
+  padding: 0.55rem 0.7rem;
+  font-size: 0.84rem;
+  line-height: 1.4;
 }
 
 /* --- group branding settings -------------------------------------------- */
@@ -5869,6 +6172,8 @@ h3,
 }
 
 .branding-preview img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;

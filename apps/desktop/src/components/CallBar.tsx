@@ -1,13 +1,15 @@
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
-import type { MusicChannelState } from "@molezinha/shared";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import type { MusicChannelState, Profile } from "@molezinha/shared";
 import { callClient, isMusicPeerId, type RemotePeerMedia } from "../lib/calls";
 import { useAuth } from "../lib/auth";
 import { onVoiceSettingsChange, readVoiceSettings, applyAudioOutput } from "../lib/voiceSettings";
+import { splitPresence } from "../lib/presence";
 import {
   IconCollapse,
   IconExpand,
   IconFullscreen,
   IconFullscreenExit,
+  IconHeadphonesOff,
   IconMic,
   IconMicOff,
   IconMusic,
@@ -19,32 +21,29 @@ import {
 import { Avatar } from "./Avatar";
 import { NeoTooltip } from "./NeoTooltip";
 import { MusicPanel } from "./MusicPanel";
+import { MemberContextMenu, type MemberMenuAction } from "./MemberContextMenu";
 
 interface Props {
   channelId: string;
   channelName: string;
   userId: string;
   isStaff: boolean;
+  members: (Profile & { role?: string; server_muted?: boolean; server_deafened?: boolean })[];
+  canModerateMember: (role?: string) => boolean;
   onLeave: () => void;
+  onOpenProfile: (userId: string) => void;
+  onVoiceModeration: (userId: string, muted: boolean, deafened: boolean) => void;
 }
 
-function getOutputVolume() {
-  return readVoiceSettings().outputVolume;
-}
-
-/** WebView2 often blocks autoplay until a click — re-kick all remote <audio>. */
 function kickRemoteAudioPlayback() {
+  callClient.applyPeerVolumes();
   const settings = readVoiceSettings();
-  const musicVolume = callClient.getMusicVolume();
   const nodes = document.querySelectorAll<HTMLAudioElement>(".call-ui audio.call-remote-audio");
   for (const el of nodes) {
     if (!el.srcObject) continue;
-    el.muted = false;
-    el.volume = el.classList.contains("call-music-audio") ? musicVolume : settings.outputVolume;
     void applyAudioOutput(el, settings.outputDeviceId);
     void el.play().catch((err) => console.warn("[call] remote audio play failed", err));
   }
-  // Same gesture unlocks the outgoing RNNoise AudioContext (or falls back to raw mic).
   void callClient.ensureOutgoingAudioAlive();
 }
 
@@ -56,13 +55,25 @@ function formatElapsed(totalSeconds: number) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Props) {
+export function CallBar({
+  channelId,
+  channelName,
+  userId,
+  isStaff,
+  members,
+  canModerateMember,
+  onLeave,
+  onOpenProfile,
+  onVoiceModeration,
+}: Props) {
   const { profile } = useAuth();
   const initial = callClient.getMediaState();
   const [muted, setMuted] = useState(initial.audioMuted);
   const [videoOn, setVideoOn] = useState(initial.videoEnabled);
   const [sharing, setSharing] = useState(initial.screenSharing);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(initial.screenStream);
+  const [serverMuted, setServerMuted] = useState(initial.serverMuted);
+  const [serverDeafened, setServerDeafened] = useState(initial.serverDeafened);
   const [busy, setBusy] = useState(false);
   const [peers, setPeers] = useState<Map<string, RemotePeerMedia>>(() => callClient.getPeersSnapshot());
   const [localStream, setLocalStream] = useState<MediaStream | null>(() => callClient.getLocalStream());
@@ -72,8 +83,18 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
   );
   const [elapsed, setElapsed] = useState(0);
   const [focusedTile, setFocusedTile] = useState<string | null>(null);
+  const [speakingIds, setSpeakingIds] = useState<Set<string>>(() => new Set());
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    userId: string;
+    peerId?: string;
+    volume: boolean;
+  } | null>(null);
+  const [volumeTick, setVolumeTick] = useState(0);
 
   useEffect(() => callClient.onMusicState(setMusicState), []);
+  useEffect(() => callClient.onSpeaking(setSpeakingIds), []);
 
   useEffect(() => {
     const startedAt = Date.now();
@@ -92,6 +113,8 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       setVideoOn(media.videoEnabled);
       setSharing(media.screenSharing);
       setScreenStream(media.screenStream);
+      setServerMuted(media.serverMuted);
+      setServerDeafened(media.serverDeafened);
       queueMicrotask(() => kickRemoteAudioPlayback());
     });
     return () => {
@@ -107,6 +130,7 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
 
   async function toggleMute() {
     if (busy) return;
+    if (!muted && (serverMuted || serverDeafened)) return;
     setBusy(true);
     setStatus(null);
     const next = !muted;
@@ -114,7 +138,11 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       await callClient.setAudioMuted(next);
       kickRemoteAudioPlayback();
     } catch {
-      setStatus("Não foi possível alterar o microfone.");
+      setStatus(
+        serverMuted || serverDeafened
+          ? "Seu microfone está mutado no servidor."
+          : "Não foi possível alterar o microfone."
+      );
     } finally {
       setBusy(false);
     }
@@ -160,8 +188,20 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
     }
   }
 
+  const memberById = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const peerList = [...peers.values()];
-  const humanPeers = peerList.filter((p) => !isMusicPeerId(p.peerId));
+  const humanPeers = peerList
+    .filter((p) => !isMusicPeerId(p.peerId))
+    .map((peer) => {
+      const live =
+        peer.userId === userId ? profile : peer.userId ? memberById.get(peer.userId) : undefined;
+      if (!live) return peer;
+      return {
+        ...peer,
+        displayName: live.display_name || peer.displayName,
+        avatarUrl: live.avatar_url,
+      };
+    });
   const musicPeers = peerList.filter((p) => isMusicPeerId(p.peerId));
   const screenPeers = humanPeers.filter((p) => p.screenStream);
   const selfName = profile?.display_name || "Você";
@@ -169,6 +209,52 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
   function toggleFocus(key: string) {
     setFocusedTile((current) => (current === key ? null : key));
   }
+
+  const openPeerMenu = useCallback(
+    (e: MouseEvent, userId: string, peerId?: string, volume = true) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setMenu({ x: e.clientX, y: e.clientY, userId, peerId, volume });
+    },
+    []
+  );
+
+  function memberFor(uid: string) {
+    return members.find((m) => m.id === uid);
+  }
+
+  function handleMenuAction(action: MemberMenuAction) {
+    if (!menu) return;
+    const target = memberFor(menu.userId);
+    const peer = menu.peerId ? peers.get(menu.peerId) : null;
+    switch (action.type) {
+      case "profile":
+        onOpenProfile(menu.userId);
+        break;
+      case "muteForMe":
+        callClient.mutePeerForMe(menu.userId);
+        setVolumeTick((n) => n + 1);
+        break;
+      case "focus":
+        if (menu.peerId) toggleFocus(menu.peerId);
+        break;
+      case "fullscreen":
+        break;
+      case "serverMute":
+        onVoiceModeration(menu.userId, action.muted, Boolean(target?.server_deafened || peer?.serverDeafened));
+        break;
+      case "serverDeafen":
+        onVoiceModeration(menu.userId, true, action.deafened);
+        break;
+      default:
+        break;
+    }
+    setMenu(null);
+  }
+
+  const menuTarget = menu ? memberFor(menu.userId) : null;
+  const menuPeer = menu?.peerId ? peers.get(menu.peerId) : null;
+  void volumeTick;
 
   const tiles: CallTile[] = [];
   if (sharing && screenStream) {
@@ -207,7 +293,8 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       <LocalCamTile
         stream={localStream}
         videoOn={videoOn}
-        muted={muted}
+        muted={muted || serverMuted}
+        speaking={speakingIds.has(userId)}
         name={selfName}
         avatarUrl={profile?.avatar_url}
         userId={userId}
@@ -224,9 +311,11 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       render: (opts) => (
         <RemoteTile
           peer={peer}
+          speaking={Boolean(peer.userId && speakingIds.has(peer.userId))}
           focused={opts.focused}
           allowFocus={opts.allowFocus}
           onToggleFocus={() => toggleFocus(peer.peerId)}
+          onContextMenu={(e) => openPeerMenu(e, peer.userId, peer.peerId)}
         />
       ),
     });
@@ -302,21 +391,46 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
               <span className="call-pill">{humanPeers.length + 1}</span>
             </header>
             <div className="call-roster-list">
-              <div className="call-roster-row">
-                <Avatar name={selfName} url={profile?.avatar_url} id={userId} size="sm" />
+              <div className={`call-roster-row ${speakingIds.has(userId) ? "speaking" : ""}`}>
+                <Avatar
+                  name={selfName}
+                  url={profile?.avatar_url}
+                  id={userId}
+                  size="sm"
+                  speaking={speakingIds.has(userId)}
+                  {...(profile ? splitPresence(profile) : {})}
+                />
                 <span className="call-roster-name">Você</span>
                 <span className="call-roster-flags">
-                  {muted && <IconMicOff className="icon call-roster-flag danger" />}
+                  {(muted || serverMuted) && (
+                    <IconMicOff className={`icon call-roster-flag danger${serverMuted ? " server" : ""}`} />
+                  )}
+                  {serverDeafened && <IconHeadphonesOff className="icon call-roster-flag danger server" />}
                   {!videoOn && <IconVideoOff className="icon call-roster-flag off" />}
                   {sharing && <IconScreen className="icon call-roster-flag live" />}
                 </span>
               </div>
               {humanPeers.map((peer) => (
-                <div className="call-roster-row" key={peer.peerId}>
-                  <Avatar name={peer.displayName} id={peer.peerId} size="sm" />
+                <div
+                  className={`call-roster-row ${peer.userId && speakingIds.has(peer.userId) ? "speaking" : ""}`}
+                  key={peer.peerId}
+                  onContextMenu={(e) => openPeerMenu(e, peer.userId, peer.peerId)}
+                >
+                  <Avatar
+                    name={peer.displayName}
+                    url={peer.avatarUrl}
+                    id={peer.userId || peer.peerId}
+                    size="sm"
+                    speaking={Boolean(peer.userId && speakingIds.has(peer.userId))}
+                  />
                   <span className="call-roster-name">{peer.displayName}</span>
                   <span className="call-roster-flags">
-                    {peer.audioMuted && <IconMicOff className="icon call-roster-flag danger" />}
+                    {(peer.audioMuted || peer.serverMuted) && (
+                      <IconMicOff className={`icon call-roster-flag danger${peer.serverMuted ? " server" : ""}`} />
+                    )}
+                    {peer.serverDeafened && (
+                      <IconHeadphonesOff className="icon call-roster-flag danger server" />
+                    )}
                     {peer.videoMuted && <IconVideoOff className="icon call-roster-flag off" />}
                     {peer.screenStream && <IconScreen className="icon call-roster-flag live" />}
                   </span>
@@ -342,6 +456,13 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
       </div>
 
       {status && <p className="call-status">{status}</p>}
+      {(serverMuted || serverDeafened) && (
+        <p className="call-ctrl-hint">
+          {serverDeafened
+            ? "Você está ensurdecido no servidor — não dá para desmutar daqui."
+            : "Seu microfone está mutado no servidor."}
+        </p>
+      )}
       <div className="call-bar">
         <div className="call-bar-id">
           <span className="call-live">
@@ -353,16 +474,25 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
           </span>
         </div>
         <div className="call-bar-actions">
-          <NeoTooltip label={muted ? "Desmutar" : "Mutar"} side="top">
+          <NeoTooltip
+            label={
+              serverMuted || serverDeafened
+                ? "Mutado no servidor"
+                : muted
+                  ? "Desmutar"
+                  : "Mutar"
+            }
+            side="top"
+          >
             <button
-              className={`call-ctrl ${muted ? "call-ctrl-danger" : ""}`}
+              className={`call-ctrl ${muted || serverMuted ? "call-ctrl-danger" : ""}`}
               type="button"
-              disabled={busy}
-              aria-pressed={muted}
+              disabled={busy || ((serverMuted || serverDeafened) && muted)}
+              aria-pressed={muted || serverMuted}
               aria-label={muted ? "Desmutar microfone" : "Mutar microfone"}
               onClick={() => void toggleMute()}
             >
-              {muted ? <IconMicOff /> : <IconMic />}
+              {muted || serverMuted ? <IconMicOff /> : <IconMic />}
             </button>
           </NeoTooltip>
           <NeoTooltip label={videoOn ? "Desligar câmera" : "Ligar câmera"} side="top">
@@ -405,6 +535,45 @@ export function CallBar({ channelId, channelName, userId, isStaff, onLeave }: Pr
           </button>
         </div>
       </div>
+      {menu && (
+        <MemberContextMenu
+          x={menu.x}
+          y={menu.y}
+          isSelf={menu.userId === userId}
+          isFriend={false}
+          username={menuTarget?.username}
+          inVoiceChannel={false}
+          canModerate={Boolean(menuTarget && canModerateMember(menuTarget.role))}
+          serverMuted={Boolean(menuPeer?.serverMuted || menuTarget?.server_muted)}
+          serverDeafened={Boolean(menuPeer?.serverDeafened || menuTarget?.server_deafened)}
+          showVolume={menu.volume && menu.userId !== userId}
+          volume={callClient.getPeerVolume(menu.userId)}
+          onVolumeChange={(v) => {
+            callClient.setPeerVolume(menu.userId, v);
+            setVolumeTick((n) => n + 1);
+          }}
+          canFocus={Boolean(menu.peerId)}
+          focused={menu.peerId === focusedTile}
+          extra={
+            <button
+              type="button"
+              className="msg-context-item"
+              onClick={() => {
+                const el = document.querySelector<HTMLElement>(
+                  `[data-tile-key="${menu.peerId ?? ""}"]`
+                );
+                if (el) void el.requestFullscreen().catch(() => undefined);
+                setMenu(null);
+              }}
+            >
+              <IconFullscreen />
+              Tela cheia
+            </button>
+          }
+          onAction={handleMenuAction}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }
@@ -429,6 +598,8 @@ interface TileShellProps {
   tag: ReactNode;
   screen?: boolean;
   off?: boolean;
+  tileKey?: string;
+  onContextMenu?: (e: MouseEvent) => void;
   children: ReactNode;
 }
 
@@ -440,6 +611,8 @@ function TileShell({
   tag,
   screen,
   off,
+  tileKey,
+  onContextMenu,
   children,
 }: TileShellProps) {
   const ref = useRef<HTMLDivElement>(null);
@@ -464,8 +637,10 @@ function TileShell({
   return (
     <div
       ref={ref}
+      data-tile-key={tileKey}
       className={`video-tile${screen ? " video-tile-screen" : ""}${off ? " video-tile-off" : ""}`}
       onDoubleClick={toggleFullscreen}
+      onContextMenu={onContextMenu}
     >
       {children}
       <span className="video-tile-tag">{tag}</span>
@@ -508,6 +683,7 @@ interface LocalCamTileProps {
   stream: MediaStream | null;
   videoOn: boolean;
   muted: boolean;
+  speaking?: boolean;
   name: string;
   avatarUrl?: string | null;
   userId: string;
@@ -520,6 +696,7 @@ function LocalCamTile({
   stream,
   videoOn,
   muted,
+  speaking,
   name,
   avatarUrl,
   userId,
@@ -547,6 +724,7 @@ function LocalCamTile({
       allowFocus={allowFocus}
       onToggleFocus={onToggleFocus}
       off={!live}
+      tileKey="local:cam"
       tag={
         <>
           {muted ? (
@@ -562,7 +740,7 @@ function LocalCamTile({
         <video className="video-tile-mirror" ref={videoRef} autoPlay muted playsInline />
       ) : (
         <div className="video-tile-placeholder">
-          <Avatar name={name} url={avatarUrl} id={userId} size="xl" />
+          <Avatar name={name} url={avatarUrl} id={userId} size="xl" speaking={speaking} />
         </div>
       )}
     </TileShell>
@@ -618,20 +796,20 @@ function ScreenShareAudio({ peer }: { peer: RemotePeerMedia }) {
     if (!el) return;
     if (liveAudioTracks.length > 0) {
       el.srcObject = new MediaStream(liveAudioTracks);
-      el.muted = false;
-      el.volume = getOutputVolume();
+      el.dataset.peerUser = peer.userId;
+      callClient.applyPeerVolumes();
       void applyAudioOutput(el);
       void el.play().catch((err) => console.warn("[call] screen audio play failed", err));
     } else {
       el.srcObject = null;
     }
-  }, [peer.screenStream, audioTrackIds]);
+  }, [peer.screenStream, audioTrackIds, peer.userId]);
 
   useEffect(() => {
     return onVoiceSettingsChange((s) => {
       const el = audioRef.current;
       if (!el) return;
-      el.volume = s.outputVolume;
+      callClient.applyPeerVolumes();
       void applyAudioOutput(el, s.outputDeviceId);
     });
   }, []);
@@ -640,6 +818,7 @@ function ScreenShareAudio({ peer }: { peer: RemotePeerMedia }) {
     <audio
       ref={audioRef}
       className="call-remote-audio"
+      data-peer-user={peer.userId}
       autoPlay
       playsInline
       aria-hidden
@@ -711,14 +890,18 @@ function MusicAudio({ peer }: { peer: RemotePeerMedia }) {
 
 function RemoteTile({
   peer,
+  speaking,
   focused,
   allowFocus,
   onToggleFocus,
+  onContextMenu,
 }: {
   peer: RemotePeerMedia;
+  speaking?: boolean;
   focused: boolean;
   allowFocus: boolean;
   onToggleFocus: () => void;
+  onContextMenu?: (e: MouseEvent) => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -732,20 +915,20 @@ function RemoteTile({
     if (!el) return;
     if (liveAudioTracks.length > 0) {
       el.srcObject = new MediaStream(liveAudioTracks);
-      el.muted = false;
-      el.volume = getOutputVolume();
+      el.dataset.peerUser = peer.userId;
+      callClient.applyPeerVolumes();
       void applyAudioOutput(el);
       void el.play().catch((err) => console.warn("[call] remote audio play failed", err));
     } else {
       el.srcObject = null;
     }
-  }, [peer.stream, audioTrackIds]);
+  }, [peer.stream, audioTrackIds, peer.userId]);
 
   useEffect(() => {
     return onVoiceSettingsChange((s) => {
       const el = audioRef.current;
       if (!el) return;
-      el.volume = s.outputVolume;
+      callClient.applyPeerVolumes();
       void applyAudioOutput(el, s.outputDeviceId);
     });
   }, []);
@@ -768,9 +951,11 @@ function RemoteTile({
       allowFocus={allowFocus}
       onToggleFocus={onToggleFocus}
       off={!hasLiveVideo}
+      tileKey={peer.peerId}
+      onContextMenu={onContextMenu}
       tag={
         <>
-          {peer.audioMuted ? (
+          {peer.audioMuted || peer.serverMuted ? (
             <IconMicOff className="icon video-tile-tag-icon danger" />
           ) : (
             <IconMic className="icon video-tile-tag-icon" />
@@ -780,12 +965,24 @@ function RemoteTile({
         </>
       }
     >
-      <audio ref={audioRef} className="call-remote-audio" autoPlay playsInline />
+      <audio
+        ref={audioRef}
+        className="call-remote-audio"
+        data-peer-user={peer.userId}
+        autoPlay
+        playsInline
+      />
       {hasLiveVideo ? (
         <video ref={videoRef} autoPlay playsInline muted />
       ) : (
         <div className="video-tile-placeholder">
-          <Avatar name={peer.displayName} id={peer.peerId} size="xl" />
+          <Avatar
+            name={peer.displayName}
+            url={peer.avatarUrl}
+            id={peer.userId || peer.peerId}
+            size="xl"
+            speaking={speaking}
+          />
         </div>
       )}
     </TileShell>

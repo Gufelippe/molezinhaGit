@@ -71,6 +71,27 @@ export function IconMicOff({ className = "icon" }: IconProps) {
   );
 }
 
+export function IconHeadphones({ className = "icon" }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 14v-2a8 8 0 0 1 16 0v2" strokeLinecap="round" />
+      <rect x="2" y="13" width="5" height="8" rx="2" />
+      <rect x="17" y="13" width="5" height="8" rx="2" />
+    </svg>
+  );
+}
+
+export function IconHeadphonesOff({ className = "icon" }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M4 14v-2a8 8 0 0 1 13.2-6.2" strokeLinecap="round" />
+      <rect x="2" y="13" width="5" height="8" rx="2" />
+      <path d="M17 17.5V21a2 2 0 0 0 2 2h1" strokeLinecap="round" />
+      <path d="m4 4 16 16" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function IconVideo({ className = "icon" }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

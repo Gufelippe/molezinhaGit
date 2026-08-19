@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import type { Friendship, Profile } from "@molezinha/shared";
+import { splitPresence } from "../lib/presence";
 import { supabase } from "../lib/supabase";
 import { useAuth } from "../lib/auth";
 import { Avatar } from "./Avatar";
@@ -8,7 +9,10 @@ import { IconFriends, IconPlus } from "./Icons";
 import { PromptModal } from "./PromptModal";
 
 type PendingRow = Friendship & {
-  requester: Pick<Profile, "id" | "username" | "display_name" | "avatar_url" | "status"> | null;
+  requester: Pick<
+    Profile,
+    "id" | "username" | "display_name" | "avatar_url" | "status"
+  > & { voice_channel_id?: string | null } | null;
 };
 
 type FriendRow = {
@@ -16,13 +20,14 @@ type FriendRow = {
   user: Profile;
 };
 
-type PersonSummary = Pick<
+type PersonSummary = (Pick<
   Profile,
   "id" | "username" | "display_name" | "avatar_url" | "status"
-> | null;
+> & { voice_channel_id?: string | null }) | null;
 
 /** One person + their actions, shared by the pending and accepted lists. */
 function PersonRow({ person, children }: { person: PersonSummary; children: ReactNode }) {
+  const presence = person ? splitPresence(person) : null;
   return (
     <div className="user-panel person-row">
       <Avatar
@@ -30,7 +35,8 @@ function PersonRow({ person, children }: { person: PersonSummary; children: Reac
         name={person?.display_name ?? "?"}
         url={person?.avatar_url}
         id={person?.id}
-        status={person?.status}
+        status={presence?.status}
+        inCall={presence?.inCall}
       />
       <div className="user-panel-identity">
         <span className="user-panel-name">{person?.display_name ?? "Alguém"}</span>
@@ -87,7 +93,7 @@ export function FriendsPanel({ friendsTick = 0, onOpenDm, onChanged }: Props) {
     if (otherIds.length) {
       const { data: profiles } = await supabase
         .from("profiles")
-        .select("id, username, display_name, avatar_url, status, custom_status, banner_color, accent_color")
+        .select("id, username, display_name, avatar_url, status, custom_status, banner_color, accent_color, voice_channel_id")
         .in("id", otherIds);
       profilesById = new Map(
         ((profiles ?? []) as Profile[]).map((p) => [p.id, p])

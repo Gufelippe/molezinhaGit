@@ -9,6 +9,7 @@ import {
 import { createPortal } from "react-dom";
 import type { Profile } from "@molezinha/shared";
 import { ProfileCard } from "./ProfileCard";
+import { splitPresence } from "../lib/presence";
 
 type Placement = "above" | "left";
 
@@ -22,6 +23,23 @@ type Props = {
   label?: string;
 };
 
+const CARD_W = 340;
+const GAP = 10;
+const MARGIN = 12;
+
+function clamp(n: number, min: number, max: number) {
+  return Math.min(Math.max(n, min), max);
+}
+
+function samePos(
+  a: { left: number; top: number; width: number } | null,
+  left: number,
+  top: number,
+  width: number
+) {
+  return Boolean(a && a.left === left && a.top === top && a.width === width);
+}
+
 export function ProfilePopout({
   open,
   profile,
@@ -32,49 +50,65 @@ export function ProfilePopout({
   label = "Perfil",
 }: Props) {
   const popRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{
-    left?: number;
-    right?: number;
-    top?: number;
-    bottom?: number;
-    maxHeight?: number;
-  } | null>(null);
+  const [pos, setPos] = useState<{ left: number; top: number; width: number } | null>(null);
 
   useLayoutEffect(() => {
     if (!open || !anchorRef.current) {
       setPos(null);
       return;
     }
+
     const update = () => {
-      const rect = anchorRef.current!.getBoundingClientRect();
-      const gap = 10;
-      if (placement === "left") {
-        const maxHeight = Math.min(520, window.innerHeight - 24);
-        let top = rect.top;
-        if (top + maxHeight > window.innerHeight - 12) {
-          top = Math.max(12, window.innerHeight - maxHeight - 12);
-        }
-        setPos({
-          right: window.innerWidth - rect.left + gap,
-          top,
-          maxHeight,
-        });
+      const anchor = anchorRef.current;
+      if (!anchor) return;
+      const rect = anchor.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const width = Math.min(CARD_W, vw - MARGIN * 2);
+      const measured = popRef.current?.offsetHeight ?? 0;
+      const height = measured || 420;
+      const maxTop = Math.max(MARGIN, vh - height - MARGIN);
+
+      let left: number;
+      let top: number;
+
+      if (placement === "above") {
+        left = clamp(rect.left, MARGIN, Math.max(MARGIN, vw - width - MARGIN));
+        const above = rect.top - GAP - height;
+        const below = rect.bottom + GAP;
+        if (above >= MARGIN) top = above;
+        else if (below + height <= vh - MARGIN) top = below;
+        else top = clamp(above, MARGIN, maxTop);
       } else {
-        setPos({
-          left: rect.left,
-          bottom: window.innerHeight - rect.top + gap,
-          maxHeight: Math.min(520, rect.top - 16),
-        });
+        const toLeft = rect.left - GAP - width;
+        const toRight = rect.right + GAP;
+        if (toLeft >= MARGIN) left = toLeft;
+        else if (toRight + width <= vw - MARGIN) left = toRight;
+        else left = clamp(toRight, MARGIN, Math.max(MARGIN, vw - width - MARGIN));
+        left = clamp(left, MARGIN, Math.max(MARGIN, vw - width - MARGIN));
+        top = clamp(rect.top, MARGIN, maxTop);
       }
+
+      setPos((prev) => (samePos(prev, left, top, width) ? prev : { left, top, width }));
     };
+
     update();
+    let ro: ResizeObserver | null = null;
+    const raf = requestAnimationFrame(() => {
+      update();
+      if (!popRef.current) return;
+      ro = new ResizeObserver(update);
+      ro.observe(popRef.current);
+    });
     window.addEventListener("resize", update);
     window.addEventListener("scroll", update, true);
     return () => {
+      cancelAnimationFrame(raf);
+      ro?.disconnect();
       window.removeEventListener("resize", update);
       window.removeEventListener("scroll", update, true);
     };
-  }, [open, anchorRef, placement]);
+  }, [open, anchorRef, placement, profile?.id]);
 
   useEffect(() => {
     if (!open) return;
@@ -97,6 +131,8 @@ export function ProfilePopout({
 
   if (!open || !profile || !pos) return null;
 
+  const presence = splitPresence(profile);
+
   return createPortal(
     <div
       className="user-popout"
@@ -105,11 +141,8 @@ export function ProfilePopout({
       aria-label={label}
       style={{
         left: pos.left,
-        right: pos.right,
         top: pos.top,
-        bottom: pos.bottom,
-        maxHeight: pos.maxHeight,
-        overflow: "auto",
+        width: pos.width,
       }}
     >
       <ProfileCard
@@ -122,7 +155,8 @@ export function ProfilePopout({
         accentColor={profile.accent_color}
         pronouns={profile.pronouns}
         customStatus={profile.custom_status}
-        status={profile.status}
+        status={presence.status}
+        inCall={presence.inCall}
         activity={profile.activity}
         footer={footer}
       />

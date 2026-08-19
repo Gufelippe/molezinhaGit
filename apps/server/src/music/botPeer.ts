@@ -43,6 +43,7 @@ export async function ensureMusicBotPeer(channelId: string): Promise<PeerState> 
     peerId,
     userId: MUSIC_BOT_USER_ID,
     displayName: "Música",
+    role: "member",
     transports: new Map(),
     producers: new Map(),
     consumers: new Map(),

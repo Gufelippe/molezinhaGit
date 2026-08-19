@@ -7,6 +7,7 @@ import {
   unlockCallSounds,
 } from "./callSounds";
 import { createVoiceChain, type VoiceChain } from "./audioChain";
+import { SpeakingMonitor } from "./speaking";
 import {
   applyVoiceProcessing,
   buildAudioConstraints,
@@ -22,13 +23,17 @@ type MsDevice = import("mediasoup-client").Device;
 
 export interface RemotePeerMedia {
   peerId: string;
+  userId: string;
   displayName: string;
+  avatarUrl?: string | null;
   /** Mic + camera tracks. */
   stream: MediaStream;
   /** Screen share video + optional system/tab audio, when the peer is sharing. */
   screenStream: MediaStream | null;
   audioMuted: boolean;
   videoMuted: boolean;
+  serverMuted: boolean;
+  serverDeafened: boolean;
 }
 
 type MediaState = {
@@ -36,6 +41,8 @@ type MediaState = {
   videoEnabled: boolean;
   screenSharing: boolean;
   screenStream: MediaStream | null;
+  serverMuted: boolean;
+  serverDeafened: boolean;
 };
 
 type Listener = (
@@ -45,6 +52,30 @@ type Listener = (
 ) => void;
 
 type MusicListener = (state: MusicChannelState | null) => void;
+type SpeakingListener = (ids: Set<string>) => void;
+
+const PEER_VOLUME_KEY = "molezinha.peerVolume";
+
+function loadPeerVolumes(): Map<string, number> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PEER_VOLUME_KEY) || "{}") as Record<string, unknown>;
+    const map = new Map<string, number>();
+    for (const [id, value] of Object.entries(raw)) {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        map.set(id, Math.min(1, Math.max(0, value)));
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+function savePeerVolumes(map: Map<string, number>) {
+  const obj: Record<string, number> = {};
+  for (const [id, value] of map) obj[id] = value;
+  localStorage.setItem(PEER_VOLUME_KEY, JSON.stringify(obj));
+}
 
 export function isMusicPeerId(peerId: string) {
   return peerId.startsWith("music:");
@@ -63,9 +94,15 @@ export class CallClient {
   private screenAudioProducer: msTypes.Producer | null = null;
   private peers = new Map<string, RemotePeerMedia>();
   private peerNames = new Map<string, string>();
+  private peerUserIds = new Map<string, string>();
+  private peerAvatars = new Map<string, string | null>();
   private pending = new Map<string, (msg: CallServerMessage) => void>();
   private listeners = new Set<Listener>();
   private musicListeners = new Set<MusicListener>();
+  private speakingListeners = new Set<SpeakingListener>();
+  private speaking = new SpeakingMonitor();
+  private peerVolumes = loadPeerVolumes();
+  private voiceModeration = new Map<string, { muted: boolean; deafened: boolean }>();
   private musicState: MusicChannelState | null = null;
   private musicVolume = 0.8;
   private channelId: string | null = null;
@@ -75,6 +112,8 @@ export class CallClient {
   private joinLock: Promise<void> = Promise.resolve();
   private audioMuted = false;
   private videoEnabled = false;
+  private serverMuted = false;
+  private serverDeafened = false;
   private leaving = false;
   /** Producers that arrived before recv transport was ready */
   private pendingConsumes: Array<{
@@ -105,6 +144,10 @@ export class CallClient {
   constructor() {
     this.unsubVoiceSettings = onVoiceSettingsChange((s) => {
       void this.applyLiveVoiceSettings(s);
+      this.applyPeerVolumes();
+    });
+    this.speaking.onChange((ids) => {
+      for (const fn of this.speakingListeners) fn(ids);
     });
   }
 
@@ -123,6 +166,53 @@ export class CallClient {
     return () => {
       this.musicListeners.delete(fn);
     };
+  }
+
+  onSpeaking(fn: SpeakingListener) {
+    this.speakingListeners.add(fn);
+    fn(this.speaking.current());
+    return () => {
+      this.speakingListeners.delete(fn);
+    };
+  }
+
+  getPeerVolume(userId: string) {
+    return this.peerVolumes.get(userId) ?? 1;
+  }
+
+  setPeerVolume(userId: string, volume: number) {
+    const next = Math.min(1, Math.max(0, volume));
+    this.peerVolumes.set(userId, next);
+    savePeerVolumes(this.peerVolumes);
+    this.applyPeerVolumes();
+  }
+
+  mutePeerForMe(userId: string) {
+    this.setPeerVolume(userId, 0);
+  }
+
+  isLocalServerMuted() {
+    return this.serverMuted || this.serverDeafened;
+  }
+
+  isLocalServerDeafened() {
+    return this.serverDeafened;
+  }
+
+  sendServerVoiceModeration(userId: string, muted: boolean, deafened: boolean) {
+    this.send({ type: "serverVoiceModeration", userId, muted, deafened });
+  }
+
+  applyPeerVolumes() {
+    const nodes = document.querySelectorAll<HTMLAudioElement>("audio.call-remote-audio");
+    for (const el of nodes) {
+      if (el.classList.contains("call-music-audio")) continue;
+      const userId = el.dataset.peerUser;
+      const peerVol = userId ? this.getPeerVolume(userId) : 1;
+      const settingsVol = readVoiceSettings().outputVolume;
+      el.volume = Math.min(1, settingsVol * peerVol);
+      el.muted = this.serverDeafened || peerVol <= 0;
+    }
   }
 
   getMusicState() {
@@ -164,6 +254,71 @@ export class CallClient {
   private emit() {
     const media = this.getMediaState();
     for (const fn of this.listeners) fn(new Map(this.peers), this.localStream, media);
+    this.syncSpeaking();
+    queueMicrotask(() => this.applyPeerVolumes());
+  }
+
+  private rememberPeer(info: {
+    peerId: string;
+    userId?: string;
+    displayName?: string;
+    avatarUrl?: string | null;
+  }) {
+    if (info.displayName) this.peerNames.set(info.peerId, info.displayName);
+    if (info.userId) this.peerUserIds.set(info.peerId, info.userId);
+    if (info.avatarUrl !== undefined) this.peerAvatars.set(info.peerId, info.avatarUrl ?? null);
+  }
+
+  private emptyPeer(peerId: string, extras?: Partial<RemotePeerMedia>): RemotePeerMedia {
+    const userId = extras?.userId ?? this.peerUserIds.get(peerId) ?? "";
+    const mod = this.voiceModeration.get(userId);
+    return {
+      peerId,
+      userId,
+      displayName: extras?.displayName ?? this.peerNames.get(peerId) ?? "Amigo",
+      avatarUrl: extras?.avatarUrl ?? this.peerAvatars.get(peerId) ?? null,
+      stream: extras?.stream ?? new MediaStream(),
+      screenStream: extras?.screenStream ?? null,
+      audioMuted: extras?.audioMuted ?? false,
+      videoMuted: extras?.videoMuted ?? true,
+      serverMuted: extras?.serverMuted ?? Boolean(mod?.muted),
+      serverDeafened: extras?.serverDeafened ?? Boolean(mod?.deafened),
+    };
+  }
+
+  private applyVoiceModeration(userId: string, muted: boolean, deafened: boolean) {
+    this.voiceModeration.set(userId, { muted, deafened });
+    if (this.localUserId && userId === this.localUserId) {
+      this.serverMuted = muted;
+      this.serverDeafened = deafened;
+      if ((muted || deafened) && !this.audioMuted) {
+        void this.setAudioMuted(true).catch(() => undefined);
+      }
+    }
+    for (const [peerId, peer] of this.peers) {
+      if (peer.userId !== userId) continue;
+      this.peers.set(peerId, {
+        ...peer,
+        serverMuted: muted,
+        serverDeafened: deafened,
+        audioMuted: muted || deafened ? true : peer.audioMuted,
+      });
+    }
+    this.emit();
+  }
+
+  private syncSpeaking() {
+    const keep = new Set<string>();
+    if (this.localUserId && this.localStream) {
+      keep.add(this.localUserId);
+      void this.speaking.attach(this.localUserId, this.localStream);
+    }
+    for (const peer of this.peers.values()) {
+      if (!peer.userId || isMusicPeerId(peer.peerId)) continue;
+      keep.add(peer.userId);
+      void this.speaking.attach(peer.userId, peer.stream);
+    }
+    this.speaking.keep(keep);
   }
 
   getMediaState(): MediaState {
@@ -172,6 +327,8 @@ export class CallClient {
       videoEnabled: this.videoEnabled,
       screenSharing: Boolean(this.screenProducer && !this.screenProducer.closed),
       screenStream: this.screenStream,
+      serverMuted: this.serverMuted,
+      serverDeafened: this.serverDeafened,
     };
   }
 
@@ -209,17 +366,16 @@ export class CallClient {
         this.localPeerIds.add(msg.peer.peerId);
         return;
       }
-      this.peerNames.set(msg.peer.peerId, msg.peer.displayName);
-      // Show tile immediately — media tracks arrive via consume/newProducer.
+      this.rememberPeer(msg.peer);
       if (!this.peers.has(msg.peer.peerId)) {
-        this.peers.set(msg.peer.peerId, {
-          peerId: msg.peer.peerId,
-          displayName: msg.peer.displayName,
-          stream: new MediaStream(),
-          screenStream: null,
-          audioMuted: false,
-          videoMuted: true,
-        });
+        this.peers.set(
+          msg.peer.peerId,
+          this.emptyPeer(msg.peer.peerId, {
+            userId: msg.peer.userId,
+            displayName: msg.peer.displayName,
+            avatarUrl: msg.peer.avatarUrl,
+          })
+        );
         this.emit();
         if (!isMusicPeerId(msg.peer.peerId)) playCallJoinSound();
       }
@@ -310,6 +466,16 @@ export class CallClient {
       this.emitMusic();
       queueMicrotask(() => this.applyMusicVolume());
     }
+
+    if (msg.type === "serverVoiceModeration") {
+      this.applyVoiceModeration(msg.userId, msg.muted, msg.deafened);
+    }
+
+    if (msg.type === "joined" && msg.voiceModeration) {
+      for (const row of msg.voiceModeration) {
+        this.applyVoiceModeration(row.userId, row.muted, row.deafened);
+      }
+    }
   }
 
   /** Rebuild stream identities (React needs new refs) and recompute video state. */
@@ -394,16 +560,21 @@ export class CallClient {
           this.localPeerIds.add(p.peerId);
           continue;
         }
-        this.peerNames.set(p.peerId, p.displayName);
+        this.rememberPeer(p);
         if (!this.peers.has(p.peerId)) {
-          this.peers.set(p.peerId, {
-            peerId: p.peerId,
-            displayName: p.displayName,
-            stream: new MediaStream(),
-            screenStream: null,
-            audioMuted: false,
-            videoMuted: true,
-          });
+          this.peers.set(
+            p.peerId,
+            this.emptyPeer(p.peerId, {
+              userId: p.userId,
+              displayName: p.displayName,
+              avatarUrl: p.avatarUrl,
+            })
+          );
+        }
+      }
+      if (joined.voiceModeration) {
+        for (const row of joined.voiceModeration) {
+          this.applyVoiceModeration(row.userId, row.muted, row.deafened);
         }
       }
       this.emit();
@@ -464,7 +635,7 @@ export class CallClient {
           track,
           appData: { source: "mic" },
         });
-        if (opts.muteOnJoin) {
+        if (opts.muteOnJoin || this.serverMuted || this.serverDeafened) {
           await this.audioProducer.pause();
           track.enabled = false;
           this.audioMuted = true;
@@ -928,14 +1099,9 @@ export class CallClient {
 
       let peer = this.peers.get(peerId);
       if (!peer) {
-        peer = {
-          peerId,
-          displayName: this.peerNames.get(peerId) ?? "Amigo",
-          stream: new MediaStream(),
-          screenStream: null,
-          audioMuted: false,
+        peer = this.emptyPeer(peerId, {
           videoMuted: kind !== "audio",
-        };
+        });
         this.peers.set(peerId, peer);
       }
       if (resolvedSource === "screen") {
@@ -958,6 +1124,9 @@ export class CallClient {
   }
 
   async setAudioMuted(muted: boolean) {
+    if (!muted && (this.serverMuted || this.serverDeafened)) {
+      throw new Error("Seu microfone está mutado no servidor");
+    }
     if (!this.audioProducer) {
       this.audioMuted = muted;
       this.emit();
@@ -1197,11 +1366,17 @@ export class CallClient {
     this.device = null;
     this.peers.clear();
     this.peerNames.clear();
+    this.peerUserIds.clear();
+    this.peerAvatars.clear();
+    this.voiceModeration.clear();
+    this.speaking.close();
     this.channelId = null;
     this.localUserId = null;
     this.localPeerIds.clear();
     this.audioMuted = false;
     this.videoEnabled = false;
+    this.serverMuted = false;
+    this.serverDeafened = false;
     this.musicState = null;
     this.emitMusic();
     this.releaseMediaDevices();

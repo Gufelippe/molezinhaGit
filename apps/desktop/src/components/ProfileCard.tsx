@@ -13,6 +13,7 @@ type Props = {
   pronouns?: string | null;
   customStatus?: string | null;
   status?: Profile["status"] | null;
+  inCall?: boolean;
   activity?: UserActivity | null;
   editableAvatar?: boolean;
   editableBanner?: boolean;
@@ -23,7 +24,6 @@ type Props = {
 
 function statusClass(status: Profile["status"] | null | undefined) {
   if (status === "offline") return "offline";
-  if (status === "in_call") return "in_call";
   if (status === "idle") return "idle";
   if (status === "dnd") return "dnd";
   return "";
@@ -40,6 +40,7 @@ export function ProfileCard({
   pronouns,
   customStatus,
   status = "online",
+  inCall = false,
   activity = null,
   editableAvatar = false,
   editableBanner = false,
@@ -91,7 +92,9 @@ export function ProfileCard({
           ) : (
             <div className="profile-card-avatar profile-card-avatar-fallback">{initial}</div>
           )}
-          <span className={`profile-card-status status-dot ${statusClass(status)}`} />
+          <span
+            className={`profile-card-status status-dot ${statusClass(status === "in_call" ? "online" : status)}${inCall || status === "in_call" ? " in-voice" : ""}`}
+          />
         </div>
 
         <div className="profile-card-identity">

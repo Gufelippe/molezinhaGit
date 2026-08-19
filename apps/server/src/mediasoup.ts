@@ -67,6 +67,8 @@ export interface PeerState {
   peerId: string;
   userId: string;
   displayName: string;
+  avatarUrl?: string | null;
+  role: "owner" | "admin" | "member";
   transports: Map<string, WebRtcTransport | PlainTransport>;
   producers: Map<string, Producer>;
   consumers: Map<string, Consumer>;
@@ -75,8 +77,10 @@ export interface PeerState {
 
 export interface RoomState {
   channelId: string;
+  groupId: string | null;
   router: Router;
   peers: Map<string, PeerState>;
+  voiceModeration: Map<string, { muted: boolean; deafened: boolean }>;
 }
 
 const rooms = new Map<string, RoomState>();
@@ -89,7 +93,13 @@ export async function getOrCreateRoom(channelId: string): Promise<RoomState> {
   const router = await w.createRouter({
     mediaCodecs: mediaCodecs as mediasoup.types.RtpCodecCapability[],
   });
-  const room: RoomState = { channelId, router, peers: new Map() };
+  const room: RoomState = {
+    channelId,
+    groupId: null,
+    router,
+    peers: new Map(),
+    voiceModeration: new Map(),
+  };
   rooms.set(channelId, room);
   return room;
 }

@@ -242,6 +242,8 @@ export interface GroupMember {
   user_id: string;
   role: "owner" | "admin" | "member";
   joined_at: string;
+  server_muted: boolean;
+  server_deafened: boolean;
 }
 
 export type FriendshipStatus = "pending" | "accepted" | "rejected";
@@ -304,10 +306,11 @@ export type CallSignal =
     }
   | { type: "resumeConsumer"; consumerId: string }
   | { type: "closeProducer"; producerId: string }
-  | { type: "mute"; kind: "audio" | "video"; muted: boolean };
+  | { type: "mute"; kind: "audio" | "video"; muted: boolean }
+  | { type: "serverVoiceModeration"; userId: string; muted: boolean; deafened: boolean };
 
 export type CallServerMessage =
-  | { type: "joined"; peers: CallPeerInfo[]; routerRtpCapabilities: unknown }
+  | { type: "joined"; peers: CallPeerInfo[]; routerRtpCapabilities: unknown; voiceModeration?: VoiceModerationState[] }
   | { type: "peerJoined"; peer: CallPeerInfo }
   | { type: "peerLeft"; peerId: string }
   | { type: "routerRtpCapabilities"; routerRtpCapabilities: unknown }
@@ -344,6 +347,7 @@ export type CallServerMessage =
     }
   | { type: "producerClosed"; peerId: string; producerId: string }
   | { type: "peerMute"; peerId: string; kind: "audio" | "video"; muted: boolean }
+  | { type: "serverVoiceModeration"; userId: string; muted: boolean; deafened: boolean }
   | { type: "musicState"; state: MusicChannelState }
   | { type: "error"; message: string };
 
@@ -356,8 +360,15 @@ export interface CallPeerInfo {
   peerId: string;
   userId: string;
   displayName: string;
+  avatarUrl?: string | null;
   producers: { id: string; kind: "audio" | "video"; appData?: MediaAppData }[];
 }
+
+export type VoiceModerationState = {
+  userId: string;
+  muted: boolean;
+  deafened: boolean;
+};
 
 /** One queued or playing track for the voice-channel music bot. */
 export type MusicTrack = {

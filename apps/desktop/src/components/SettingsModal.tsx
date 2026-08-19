@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Profile, PublicProfilePatch, ThemePreference, ThemeSettings } from "@molezinha/shared";
 import { useAuth } from "../lib/auth";
+import { splitPresence } from "../lib/presence";
 import { supabase } from "../lib/supabase";
 import { socialClient } from "../lib/social";
 import {
@@ -758,7 +759,8 @@ export function SettingsModal({ open, onClose, initialSection = "account" }: Pro
                 accentColor={accentColor}
                 pronouns={pronouns}
                 customStatus={customStatus}
-                status={profile?.status ?? "online"}
+                status={profile ? splitPresence(profile).status : "online"}
+                inCall={profile ? splitPresence(profile).inCall : false}
                 activity={profile?.activity ?? null}
                 editableAvatar
                 editableBanner

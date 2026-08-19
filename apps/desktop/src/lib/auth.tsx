@@ -11,6 +11,7 @@ import {
 import type { Session, User } from "@supabase/supabase-js";
 import type { Profile, ThemePreference, ThemeSettings } from "@molezinha/shared";
 import { supabase } from "./supabase";
+import { setOnlineUserIds, setPresenceViewer } from "./presence";
 import {
   applyAppearance,
   emptyThemeSettings,
@@ -58,6 +59,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       (localStorage.getItem("molezinha.theme") as ThemePreference) || "dark"
     )
   );
+  const [onlineRev, setOnlineRev] = useState(0);
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const pushAppearance = useCallback((nextTheme: ThemePreference, nextSettings: ThemeSettings) => {
@@ -158,6 +160,47 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [session, refreshProfile]);
 
+  // Live connections, not the last saved `profiles.status` (that stays online after close).
+  useEffect(() => {
+    const userId = session?.user.id;
+    setPresenceViewer(userId ?? null);
+    if (!userId) {
+      setOnlineUserIds(new Set());
+      return;
+    }
+
+    const channel = supabase.channel("molezinha-presence", {
+      config: { presence: { key: userId } },
+    });
+
+    const sync = () => {
+      setOnlineUserIds(new Set(Object.keys(channel.presenceState())));
+      setOnlineRev((n) => n + 1);
+    };
+    channel.on("presence", { event: "sync" }, sync);
+    channel.on("presence", { event: "join" }, sync);
+    channel.on("presence", { event: "leave" }, sync);
+
+    channel.subscribe((status) => {
+      if (status !== "SUBSCRIBED") return;
+      void channel.track({ at: Date.now() });
+    });
+
+    const clearVoiceSeat = () => {
+      void supabase.from("profiles").update({ voice_channel_id: null }).eq("id", userId);
+    };
+    window.addEventListener("pagehide", clearVoiceSeat);
+    window.addEventListener("beforeunload", clearVoiceSeat);
+
+    return () => {
+      window.removeEventListener("pagehide", clearVoiceSeat);
+      window.removeEventListener("beforeunload", clearVoiceSeat);
+      setPresenceViewer(null);
+      setOnlineUserIds(new Set());
+      void supabase.removeChannel(channel);
+    };
+  }, [session?.user.id]);
+
   const updateProfile = useCallback(async (patch: Partial<Profile>) => {
     const userId = (await supabase.auth.getUser()).data.user?.id;
     if (!userId) return null;
@@ -247,6 +290,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setThemeSettings,
       setAppearance,
       resolvedTheme,
+      onlineRev,
     ]
   );
 

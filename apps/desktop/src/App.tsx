@@ -28,6 +28,7 @@ import {
   cacheSticker,
   fetchRecentMessages,
   hydrateMessage,
+  peekRecentMessages,
   playMessageBeep,
   uploadMessageAttachments,
   type PendingAttachment,
@@ -72,6 +73,8 @@ import {
   ForwardDestinationModal,
   type ForwardDestination,
 } from "./components/ForwardDestinationModal";
+import { splitPresence } from "./lib/presence";
+import { MemberContextMenu, type MemberMenuAction } from "./components/MemberContextMenu";
 import type { ContextMenuAction } from "./components/MessageContextMenu";
 import {
   IconAt,
@@ -82,10 +85,13 @@ import {
   IconCopy,
   IconFriends,
   IconHash,
+  IconHeadphonesOff,
   IconJoin,
   IconMegaphone,
+  IconMicOff,
   IconPin,
   IconPlus,
+  IconScreen,
   IconSearch,
   IconSettings,
   IconSpeaker,
@@ -143,6 +149,15 @@ type FriendRequest = {
 
 type ChannelUnread = { count: number; mentions: number; groupId: string };
 
+type MemberProfile = Profile & {
+  role?: string;
+  server_muted?: boolean;
+  server_deafened?: boolean;
+};
+
+const MEMBER_PROFILE_COLS =
+  "id, display_name, avatar_url, username, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color, voice_channel_id";
+
 /** Accent bar that slides between the active channel/DM rows. */
 function NavMarker() {
   return (
@@ -165,7 +180,7 @@ export default function App() {
   const [groups, setGroups] = useState<Group[]>([]);
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
-  const [members, setMembers] = useState<(Profile & { role?: string })[]>([]);
+  const [members, setMembers] = useState<MemberProfile[]>([]);
   const [myRole, setMyRole] = useState<"owner" | "admin" | "member">("member");
   const [view, setView] = useState<View>({ kind: "home" });
   const [messages, setMessages] = useState<Message[]>([]);
@@ -227,6 +242,17 @@ export default function App() {
   const [bookmarkedIds, setBookmarkedIds] = useState<Set<string>>(() => new Set());
   const [mutualGroups, setMutualGroups] = useState<MutualGroup[]>([]);
   const [memberNote, setMemberNote] = useState("");
+  const [memberMenu, setMemberMenu] = useState<{ x: number; y: number; userId: string } | null>(
+    null
+  );
+  const [speakingIds, setSpeakingIds] = useState<Set<string>>(() => new Set());
+  const [callPeers, setCallPeers] = useState(() => callClient.getPeersSnapshot());
+  const [localCallMuted, setLocalCallMuted] = useState(
+    () => callClient.getMediaState().audioMuted
+  );
+  const [localCallSharing, setLocalCallSharing] = useState(
+    () => callClient.getMediaState().screenSharing
+  );
   const userPanelRef = useRef<HTMLDivElement>(null);
   const memberAnchorRef = useRef<HTMLElement | null>(null);
   const memberRowRefs = useRef(new Map<string, HTMLElement>());
@@ -302,7 +328,7 @@ export default function App() {
     const { data: profiles } = await supabase
       .from("profiles")
       .select(
-        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color"
+        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color, voice_channel_id"
       )
       .in("id", [...ids]);
     const list = ((profiles ?? []) as Profile[]).slice().sort((a, b) =>
@@ -329,7 +355,7 @@ export default function App() {
     const { data: profiles } = await supabase
       .from("profiles")
       .select(
-        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color"
+        "id, username, display_name, avatar_url, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color, voice_channel_id"
       )
       .in(
         "id",
@@ -360,7 +386,7 @@ export default function App() {
     }
     const { data: others } = await supabase
       .from("direct_conversation_members")
-      .select("conversation_id, user_id, profiles(id, display_name, avatar_url, username, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color)")
+      .select("conversation_id, user_id, profiles(id, display_name, avatar_url, username, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color, voice_channel_id)")
       .in("conversation_id", convIds)
       .neq("user_id", user.id);
 
@@ -794,19 +820,28 @@ export default function App() {
           .order("position"),
         supabase
           .from("group_members")
-          .select("user_id, role, profiles(id, display_name, avatar_url, username, status, custom_status, activity, bio, pronouns, banner_url, banner_color, accent_color)")
+          .select(`user_id, role, server_muted, server_deafened, profiles(${MEMBER_PROFILE_COLS})`)
           .eq("group_id", activeGroupId),
       ]);
       setChannels((ch as Channel[]) ?? []);
       const rows = (mem ?? []) as {
         user_id: string;
         role: "owner" | "admin" | "member";
+        server_muted?: boolean;
+        server_deafened?: boolean;
         profiles: Profile | Profile[] | null;
       }[];
       const profiles = rows.map((m) => {
         const p = Array.isArray(m.profiles) ? m.profiles[0] : m.profiles;
-        return p ? { ...p, role: m.role } : null;
-      }).filter(Boolean) as (Profile & { role: string })[];
+        return p
+          ? {
+              ...p,
+              role: m.role,
+              server_muted: Boolean(m.server_muted),
+              server_deafened: Boolean(m.server_deafened),
+            }
+          : null;
+      }).filter(Boolean) as MemberProfile[];
       setMembers(profiles);
       cacheAuthors(profiles);
       const mine = rows.find((r) => r.user_id === user.id);
@@ -863,6 +898,62 @@ export default function App() {
       void supabase.removeChannel(sub);
     };
   }, [activeGroupId, memberIdsKey]);
+
+  useEffect(() => callClient.onSpeaking(setSpeakingIds), []);
+  useEffect(
+    () =>
+      callClient.onUpdate((peers, _local, media) => {
+        setCallPeers(peers);
+        setLocalCallMuted(media.audioMuted || media.serverMuted);
+        setLocalCallSharing(media.screenSharing);
+      }),
+    []
+  );
+
+  useEffect(() => {
+    if (!activeGroupId) return;
+    const ch = supabase
+      .channel(`gm-mod:${activeGroupId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "group_members",
+          filter: `group_id=eq.${activeGroupId}`,
+        },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            const uid = (payload.old as { user_id?: string } | undefined)?.user_id;
+            if (uid) setMembers((prev) => prev.filter((m) => m.id !== uid));
+            return;
+          }
+          const row = payload.new as {
+            user_id?: string;
+            role?: string;
+            server_muted?: boolean;
+            server_deafened?: boolean;
+          };
+          if (!row.user_id) return;
+          setMembers((prev) =>
+            prev.map((m) =>
+              m.id === row.user_id
+                ? {
+                    ...m,
+                    role: row.role ?? m.role,
+                    server_muted: Boolean(row.server_muted),
+                    server_deafened: Boolean(row.server_deafened),
+                  }
+                : m
+            )
+          );
+        }
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(ch);
+    };
+  }, [activeGroupId]);
 
   useEffect(() => {
     if (profile) cacheAuthor(profile);
@@ -956,7 +1047,17 @@ export default function App() {
     };
   }, [session]);
 
-  useEffect(() => {
+  const threadId =
+    view.kind === "channel"
+      ? view.channel.id
+      : view.kind === "dm"
+        ? view.conversationId
+        : "home";
+  const [activeThreadId, setActiveThreadId] = useState(threadId);
+  if (threadId !== activeThreadId) {
+    setActiveThreadId(threadId);
+    setMessages([]);
+    setMessagesLoading(true);
     setReplyTo(null);
     setForwardSource(null);
     setUnreadSince(null);
@@ -964,9 +1065,7 @@ export default function App() {
     setSearchOpen(false);
     setHighlightMessageId(null);
     setTypingPeers(new Map());
-  }, [
-    view.kind === "channel" ? view.channel.id : view.kind === "dm" ? view.conversationId : "home",
-  ]);
+  }
 
   /** Attachments land a beat after their message, so patch them in when they arrive. */
   const applyAttachmentRow = useCallback((row: MessageAttachment) => {
@@ -987,7 +1086,14 @@ export default function App() {
     if (view.kind !== "channel") return;
     const channelId = view.channel.id;
     let cancelled = false;
-    setMessagesLoading(true);
+    const cached = peekRecentMessages("messages", channelId);
+    if (cached) {
+      setMessages(cached);
+      setMessagesLoading(false);
+    } else {
+      setMessages([]);
+      setMessagesLoading(true);
+    }
 
     void (async () => {
       const rows = await fetchRecentMessages(
@@ -1214,7 +1320,14 @@ export default function App() {
     const conversationId = view.conversationId;
     cacheAuthor(view.other);
     let cancelled = false;
-    setMessagesLoading(true);
+    const cached = peekRecentMessages("direct_messages", conversationId);
+    if (cached) {
+      setMessages(cached);
+      setMessagesLoading(false);
+    } else {
+      setMessages([]);
+      setMessagesLoading(true);
+    }
 
     void (async () => {
       const rows = await fetchRecentMessages(
@@ -1434,7 +1547,7 @@ export default function App() {
     if (!user || !profile) return;
     const status = profile.status;
     if (status === "online") wasOnlineRef.current = true;
-    if (status === "dnd" || status === "in_call") return;
+    if (status === "dnd" || status === "offline") return;
 
     const clearTimer = () => {
       if (idleTimerRef.current) {
@@ -2037,6 +2150,26 @@ export default function App() {
     return false;
   }
 
+  async function setVoiceModeration(userId: string, muted: boolean, deafened: boolean) {
+    if (!activeGroupId) return;
+    const { error } = await supabase.rpc("set_group_voice_moderation", {
+      p_group_id: activeGroupId,
+      p_user_id: userId,
+      p_muted: muted,
+      p_deafened: deafened,
+    });
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    setMembers((prev) =>
+      prev.map((m) =>
+        m.id === userId ? { ...m, server_muted: muted, server_deafened: deafened } : m
+      )
+    );
+    if (inVoice) callClient.sendServerVoiceModeration(userId, muted, deafened);
+  }
+
   async function moderateMemberFromPopout(userId: string, ban: boolean, reason: string) {
     if (!activeGroupId) return;
     const { error } = await supabase.rpc("remove_group_member", {
@@ -2366,6 +2499,52 @@ export default function App() {
     }
   }
 
+  function handleMemberMenuAction(action: MemberMenuAction) {
+    if (!memberMenu) return;
+    const target = members.find((m) => m.id === memberMenu.userId);
+    if (!target) {
+      setMemberMenu(null);
+      return;
+    }
+    switch (action.type) {
+      case "profile": {
+        const el = memberRowRefs.current.get(target.id);
+        if (el) memberAnchorRef.current = el;
+        setMemberPopoutId(target.id);
+        break;
+      }
+      case "message":
+        void openDm(target);
+        break;
+      case "addFriend":
+        void addFriendById(target.username);
+        break;
+      case "call": {
+        const ch = callTargetFor(target);
+        if (ch) void joinVoice(ch);
+        break;
+      }
+      case "copyUser":
+        void navigator.clipboard.writeText(`@${target.username}`).catch(() => undefined);
+        break;
+      case "kick":
+        setMemberModeration({ userId: target.id, name: target.display_name, ban: false });
+        break;
+      case "ban":
+        setMemberModeration({ userId: target.id, name: target.display_name, ban: true });
+        break;
+      case "serverMute":
+        void setVoiceModeration(target.id, action.muted, Boolean(target.server_deafened));
+        break;
+      case "serverDeafen":
+        void setVoiceModeration(target.id, true, action.deafened);
+        break;
+      default:
+        break;
+    }
+    setMemberMenu(null);
+  }
+
   if (loading) {
     return (
       <div className="app-root">
@@ -2641,24 +2820,72 @@ export default function App() {
 
                 <div className="section-label">Canais de voz</div>
                 {voiceChannels.map((c) => {
-                    const inChannel = members.filter((m) => m.voice_channel_id === c.id);
+                    const inChannel = members.filter(
+                      (m) => m.voice_channel_id === c.id && splitPresence(m).inCall
+                    );
+                    const liveHere = inVoice && voiceChannel?.id === c.id;
                     return (
-                      <button
-                        key={c.id}
-                        type="button"
-                        className={`channel-item ${voiceChannel?.id === c.id && inVoice ? "active" : ""}`}
-                        onClick={() => void joinVoice(c)}
-                      >
-                        <IconSpeaker />
-                        <span className="channel-item-voice">
-                          {c.name}
-                          {inChannel.length > 0 && (
-                            <span className="muted channel-item-voice-peers">
-                              {inChannel.map((m) => m.display_name).join(", ")}
-                            </span>
-                          )}
-                        </span>
-                      </button>
+                      <div key={c.id} className="voice-channel-block">
+                        <button
+                          type="button"
+                          className={`channel-item ${liveHere ? "active" : ""}`}
+                          onClick={() => void joinVoice(c)}
+                        >
+                          <IconSpeaker />
+                          <span className="channel-item-name">{c.name}</span>
+                        </button>
+                        {inChannel.length > 0 && (
+                          <div className="voice-channel-members">
+                            {inChannel.map((m) => {
+                              const presence = splitPresence(m);
+                              const speaking = liveHere && speakingIds.has(m.id);
+                              const isOpen = memberPopoutId === m.id;
+                              const peer = [...callPeers.values()].find((p) => p.userId === m.id);
+                              return (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  className={`voice-channel-member ${isOpen ? "active" : ""}${speaking ? " speaking" : ""}`}
+                                  onClick={(e) => {
+                                    setUserPopoutOpen(false);
+                                    memberAnchorRef.current = e.currentTarget;
+                                    setMemberPopoutId(m.id);
+                                  }}
+                                  onContextMenu={(e) => {
+                                    e.preventDefault();
+                                    setMemberMenu({ x: e.clientX, y: e.clientY, userId: m.id });
+                                  }}
+                                >
+                                  <Avatar
+                                    size="xs"
+                                    name={m.display_name}
+                                    url={m.avatar_url}
+                                    id={m.id}
+                                    status={presence.status}
+                                    inCall={presence.inCall}
+                                    speaking={speaking}
+                                  />
+                                  <span className="voice-channel-member-name">{m.display_name}</span>
+                                  <span className="voice-channel-member-flags">
+                                    {(m.server_muted ||
+                                      peer?.audioMuted ||
+                                      (m.id === user?.id && localCallMuted)) && (
+                                      <IconMicOff className="icon danger" />
+                                    )}
+                                    {m.server_deafened && (
+                                      <IconHeadphonesOff className="icon danger" />
+                                    )}
+                                    {(peer?.screenStream ||
+                                      (m.id === user?.id && localCallSharing)) && (
+                                      <IconScreen className="icon live" />
+                                    )}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
                     );
                   })}
               </>
@@ -2723,7 +2950,8 @@ export default function App() {
                       name={dm.other.display_name}
                       url={dm.other.avatar_url}
                       id={dm.other.id}
-                      status={dm.other.status}
+                      status={splitPresence(dm.other).status}
+                      inCall={splitPresence(dm.other).inCall}
                     />
                     <span className="channel-item-name">{dm.other.display_name}</span>
                     {n > 0 && <span className="unread-badge">{formatBadgeCount(n)}</span>}
@@ -2740,6 +2968,9 @@ export default function App() {
               profile={profile}
               anchorRef={userPanelRef}
               onClose={() => setUserPopoutOpen(false)}
+              onSetStatus={(status) => {
+                void updateProfile({ status }).catch(() => undefined);
+              }}
               onEditProfile={() => {
                 setUserPopoutOpen(false);
                 setSettingsSection("profile");
@@ -2762,7 +2993,8 @@ export default function App() {
                 name={profile?.display_name ?? "?"}
                 url={profile?.avatar_url}
                 id={profile?.id}
-                status={profile?.status}
+                status={profile ? splitPresence(profile).status : undefined}
+                inCall={Boolean(profile && (splitPresence(profile).inCall || inVoice))}
               />
               <div className="user-panel-identity">
                 <span className="user-panel-name">{profile?.display_name}</span>
@@ -2849,6 +3081,16 @@ export default function App() {
                 channelName={voiceChannel.name}
                 userId={user?.id ?? ""}
                 isStaff={isStaff}
+                members={members}
+                canModerateMember={canModerateMember}
+                onOpenProfile={(id) => {
+                  const el = memberRowRefs.current.get(id);
+                  if (el) memberAnchorRef.current = el;
+                  setMemberPopoutId(id);
+                }}
+                onVoiceModeration={(id, muted, deafened) => {
+                  void setVoiceModeration(id, muted, deafened);
+                }}
                 onLeave={() => {
                   void callClient.leave();
                   setInVoice(false);
@@ -2890,6 +3132,13 @@ export default function App() {
                   </div>
                 ) : (
                 <MessageList
+                  key={
+                    view.kind === "dm"
+                      ? view.conversationId
+                      : view.kind === "channel"
+                        ? view.channel.id
+                        : "chat"
+                  }
                   messages={messagesWithBookmarks}
                   unreadSince={unreadSince}
                   myUsername={profile?.username}
@@ -3002,7 +3251,8 @@ export default function App() {
                         name={req.requester.display_name}
                         url={req.requester.avatar_url}
                         id={req.requester.id}
-                        status={req.requester.status}
+                        status={splitPresence(req.requester).status}
+                        inCall={splitPresence(req.requester).inCall}
                       />
                       <div className="user-panel-identity">
                         <span className="user-panel-name">{req.requester.display_name}</span>
@@ -3052,7 +3302,8 @@ export default function App() {
                             name={friend.display_name}
                             url={friend.avatar_url}
                             id={friend.id}
-                            status={friend.status}
+                            status={splitPresence(friend).status}
+                            inCall={splitPresence(friend).inCall}
                           />
                           <div className="user-panel-identity">
                             <span className="user-panel-name">{friend.display_name}</span>
@@ -3103,7 +3354,8 @@ export default function App() {
                             name={dm.other.display_name}
                             url={dm.other.avatar_url}
                             id={dm.other.id}
-                            status={dm.other.status}
+                            status={splitPresence(dm.other).status}
+                            inCall={splitPresence(dm.other).inCall}
                           />
                           <div className="user-panel-identity">
                             <span className="user-panel-name">{dm.other.display_name}</span>
@@ -3168,6 +3420,10 @@ export default function App() {
                       memberAnchorRef.current = e.currentTarget;
                       setMemberPopoutId(m.id);
                     }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setMemberMenu({ x: e.clientX, y: e.clientY, userId: m.id });
+                    }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
@@ -3180,19 +3436,27 @@ export default function App() {
                       name={m.display_name ?? "?"}
                       url={m.avatar_url}
                       id={m.id}
-                      status={m.status}
+                      status={splitPresence(m).status}
+                      inCall={splitPresence(m).inCall}
                     />
                     <span className="member-row-body">
                       <span className="member-row-name">{m.display_name}</span>
-                      {(m.activity?.name || m.custom_status) && (
-                        <span className="muted member-activity-line">
-                          {m.activity?.name || m.custom_status}
-                        </span>
+                      {m.custom_status && (
+                        <span className="member-custom-status">{m.custom_status}</span>
+                      )}
+                      {!m.custom_status && m.activity?.name && (
+                        <span className="muted member-activity-line">{m.activity.name}</span>
                       )}
                       {m.role && m.role !== "member" && (
                         <span className={`role-badge ${m.role}`}>{m.role}</span>
                       )}
                     </span>
+                    {(m.server_muted || m.server_deafened) && (
+                      <span className="voice-channel-member-flags">
+                        {m.server_muted && <IconMicOff className="icon danger" />}
+                        {m.server_deafened && <IconHeadphonesOff className="icon danger" />}
+                      </span>
+                    )}
                     {!isSelf && isFriend && (
                       <button
                         type="button"
@@ -3320,44 +3584,32 @@ export default function App() {
                         Adicionar amigo
                       </button>
                     )}
-                    {isStaff && canModerateMember(popMember.role) && (
-                      <div className="stack-row popout-actions">
-                        <button
-                          type="button"
-                          className="neo-btn neo-btn-grow"
-                          onClick={() => {
-                            setMemberPopoutId(null);
-                            setMemberModeration({
-                              userId: popMember.id,
-                              name: popMember.display_name,
-                              ban: false,
-                            });
-                          }}
-                        >
-                          Expulsar
-                        </button>
-                        <button
-                          type="button"
-                          className="neo-btn neo-btn-danger neo-btn-grow"
-                          onClick={() => {
-                            setMemberPopoutId(null);
-                            setMemberModeration({
-                              userId: popMember.id,
-                              name: popMember.display_name,
-                              ban: true,
-                            });
-                          }}
-                        >
-                          Banir
-                        </button>
-                      </div>
-                    )}
                   </div>
                 ) : null
               }
             />
           </aside>
         )}
+        {memberMenu && (() => {
+          const target = members.find((m) => m.id === memberMenu.userId);
+          if (!target) return null;
+          const isSelf = target.id === user?.id;
+          return (
+            <MemberContextMenu
+              x={memberMenu.x}
+              y={memberMenu.y}
+              isSelf={isSelf}
+              isFriend={friendIds.has(target.id)}
+              username={target.username}
+              inVoiceChannel={Boolean(target.voice_channel_id)}
+              canModerate={canModerateMember(target.role)}
+              serverMuted={Boolean(target.server_muted)}
+              serverDeafened={Boolean(target.server_deafened)}
+              onAction={handleMemberMenuAction}
+              onClose={() => setMemberMenu(null)}
+            />
+          );
+        })()}
       </div>
         </div>
       </div>

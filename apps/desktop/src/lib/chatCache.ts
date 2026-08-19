@@ -33,6 +33,42 @@ export function cacheAuthors(list: AuthorSnippet[]) {
   for (const p of list) cacheAuthor(p);
 }
 
+const RECENT_TTL_MS = 20_000;
+const recentCache = new Map<string, { at: number; rows: Message[] }>();
+
+function recentKey(table: string, filterVal: string) {
+  return `${table}:${filterVal}`;
+}
+
+/** Last-channel snapshot so switching back does not flash a skeleton. */
+export function peekRecentMessages(
+  table: "messages" | "direct_messages",
+  filterVal: string
+): Message[] | null {
+  const hit = recentCache.get(recentKey(table, filterVal));
+  if (!hit) return null;
+  if (Date.now() - hit.at > RECENT_TTL_MS) {
+    recentCache.delete(recentKey(table, filterVal));
+    return null;
+  }
+  return hit.rows;
+}
+
+export function putRecentMessages(
+  table: "messages" | "direct_messages",
+  filterVal: string,
+  rows: Message[]
+) {
+  recentCache.set(recentKey(table, filterVal), { at: Date.now(), rows });
+}
+
+export function invalidateRecentMessages(
+  table: "messages" | "direct_messages",
+  filterVal: string
+) {
+  recentCache.delete(recentKey(table, filterVal));
+}
+
 let beepCtx: AudioContext | null = null;
 
 /** Soft two-note chime for incoming messages. */
@@ -295,24 +331,25 @@ export async function fetchRecentMessages(
   const ids = rows.map((m) => m.id);
   const reactionTable =
     table === "messages" ? "message_reactions" : "dm_message_reactions";
-  const reactionMap = await loadReactionsForMessages(reactionTable, ids, myUserId);
   const kind = table === "messages" ? "channel" : "dm";
-  const attachmentMap = await loadAttachmentsForMessages(kind, ids);
-  const pollMap =
-    table === "messages" ? await loadPollsForMessages(ids, myUserId) : new Map();
+  const [reactionMap, attachmentMap, pollMap, pinned] = await Promise.all([
+    loadReactionsForMessages(reactionTable, ids, myUserId),
+    loadAttachmentsForMessages(kind, ids),
+    table === "messages"
+      ? loadPollsForMessages(ids, myUserId)
+      : Promise.resolve(new Map<string, MessagePollAgg>()),
+    table === "messages" ? loadPinnedIds(filterVal) : Promise.resolve(new Set<string>()),
+  ]);
 
-  let pinned = new Set<string>();
-  if (table === "messages") {
-    pinned = await loadPinnedIds(filterVal);
-  }
-
-  return rows.map((m) => ({
+  const hydrated = rows.map((m) => ({
     ...m,
     reactions: reactionMap.get(m.id) ?? [],
     attachments: attachmentMap.get(m.id) ?? [],
     poll: pollMap.get(m.id) ?? null,
     pinned: pinned.has(m.id),
   }));
+  putRecentMessages(table, filterVal, hydrated);
+  return hydrated;
 }
 
 export type PendingAttachment = {

@@ -1,8 +1,10 @@
 import type { WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
-import type { CallSignal, MediaAppData } from "@molezinha/shared";
+import type { CallSignal, MediaAppData, VoiceModerationState } from "@molezinha/shared";
 import {
+  assertCanModerateVoice,
   assertChannelMembership,
+  loadGroupVoiceModeration,
   setVoicePresence,
   verifySupabaseJwt,
 } from "./auth.js";
@@ -14,6 +16,7 @@ import {
   removePeerFromRoom,
   type DtlsParameters,
   type PeerState,
+  type RoomState,
   type RtpCapabilities,
   type RtpParameters,
 } from "./mediasoup.js";
@@ -27,6 +30,46 @@ interface SocketCtx {
 function send(socket: WebSocket, msg: unknown) {
   if (socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(msg));
+  }
+}
+
+function voiceModerationSnapshot(room: RoomState): VoiceModerationState[] {
+  return [...room.voiceModeration.entries()].map(([userId, state]) => ({
+    userId,
+    muted: state.muted,
+    deafened: state.deafened,
+  }));
+}
+
+function serializePeer(p: PeerState) {
+  return {
+    peerId: p.peerId,
+    userId: p.userId,
+    displayName: p.displayName,
+    avatarUrl: p.avatarUrl ?? null,
+    producers: [...p.producers.values()].map((pr) => ({
+      id: pr.id,
+      kind: pr.kind as "audio" | "video",
+      appData: pr.appData as MediaAppData,
+    })),
+  };
+}
+
+async function applyVoiceModerationToPeer(
+  peer: PeerState,
+  muted: boolean,
+  deafened: boolean
+) {
+  const silenceMic = muted || deafened;
+  for (const producer of peer.producers.values()) {
+    const source = (producer.appData as MediaAppData | undefined)?.source;
+    if (producer.kind !== "audio" || source === "screen" || source === "music") continue;
+    try {
+      if (silenceMic) await producer.pause();
+      else await producer.resume();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -86,6 +129,8 @@ async function handleSignal(
       peerId: ctx.peerId,
       userId: auth.userId,
       displayName: membership.displayName,
+      avatarUrl: membership.avatarUrl,
+      role: membership.role,
       transports: new Map(),
       producers: new Map(),
       consumers: new Map(),
@@ -95,25 +140,24 @@ async function handleSignal(
     room.peers.set(ctx.peerId, peer);
     ctx.channelId = data.channelId;
     ctx.userId = auth.userId;
+    room.groupId = membership.groupId;
     await setVoicePresence(auth.userId, data.channelId);
+
+    const mods = await loadGroupVoiceModeration(membership.groupId);
+    room.voiceModeration.clear();
+    for (const row of mods) {
+      room.voiceModeration.set(row.userId, { muted: row.muted, deafened: row.deafened });
+    }
 
     const peers = [...room.peers.values()]
       .filter((p) => p.peerId !== ctx.peerId)
-      .map((p) => ({
-        peerId: p.peerId,
-        userId: p.userId,
-        displayName: p.displayName,
-        producers: [...p.producers.values()].map((pr) => ({
-          id: pr.id,
-          kind: pr.kind as "audio" | "video",
-          appData: pr.appData as MediaAppData,
-        })),
-      }));
+      .map(serializePeer);
 
     send(socket, {
       type: "joined",
       peers,
       routerRtpCapabilities: room.router.rtpCapabilities,
+      voiceModeration: voiceModerationSnapshot(room),
     });
 
     try {
@@ -128,12 +172,7 @@ async function handleSignal(
       if (other.peerId.startsWith("music:")) continue;
       other.send({
         type: "peerJoined",
-        peer: {
-          peerId: peer.peerId,
-          userId: peer.userId,
-          displayName: peer.displayName,
-          producers: [],
-        },
+        peer: serializePeer(peer),
       });
     }
     return;
@@ -194,6 +233,19 @@ async function handleSignal(
       producer.on("transportclose", () => {
         peer.producers.delete(producer.id);
       });
+
+      const mod = room.voiceModeration.get(peer.userId);
+      if (
+        (mod?.muted || mod?.deafened) &&
+        data.kind === "audio" &&
+        (appData.source ?? "mic") === "mic"
+      ) {
+        try {
+          await producer.pause();
+        } catch {
+          /* ignore */
+        }
+      }
 
       send(socket, { type: "produced", id: producer.id, kind: data.kind, appData });
 
@@ -272,6 +324,39 @@ async function handleSignal(
           peerId: peer.peerId,
           kind: data.kind,
           muted: data.muted,
+        });
+      }
+      return;
+    }
+    case "serverVoiceModeration": {
+      if (!room.groupId) throw new Error("Sala sem grupo");
+      await assertCanModerateVoice(ctx.userId, room.groupId, data.userId);
+      const muted = Boolean(data.muted);
+      const deafened = Boolean(data.deafened);
+      room.voiceModeration.set(data.userId, { muted, deafened });
+      for (const target of room.peers.values()) {
+        if (target.userId !== data.userId) continue;
+        await applyVoiceModerationToPeer(target, muted, deafened);
+        if (muted || deafened) {
+          for (const other of room.peers.values()) {
+            if (other.peerId === target.peerId) continue;
+            if (other.peerId.startsWith("music:")) continue;
+            other.send({
+              type: "peerMute",
+              peerId: target.peerId,
+              kind: "audio",
+              muted: true,
+            });
+          }
+        }
+      }
+      for (const other of room.peers.values()) {
+        if (other.peerId.startsWith("music:")) continue;
+        other.send({
+          type: "serverVoiceModeration",
+          userId: data.userId,
+          muted,
+          deafened,
         });
       }
       return;

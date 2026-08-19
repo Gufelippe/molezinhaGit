@@ -48,7 +48,12 @@ export async function verifySupabaseJwt(token: string): Promise<AuthUser> {
 export async function assertChannelMembership(
   userId: string,
   channelId: string
-): Promise<{ groupId: string; displayName: string; role: "owner" | "admin" | "member" }> {
+): Promise<{
+  groupId: string;
+  displayName: string;
+  role: "owner" | "admin" | "member";
+  avatarUrl: string | null;
+}> {
   const { data: channel, error: channelError } = await supabaseAdmin
     .from("channels")
     .select("id, group_id, type, is_private")
@@ -90,7 +95,7 @@ export async function assertChannelMembership(
 
   const { data: profile } = await supabaseAdmin
     .from("profiles")
-    .select("display_name, username")
+    .select("display_name, username, avatar_url")
     .eq("id", userId)
     .maybeSingle();
 
@@ -100,6 +105,7 @@ export async function assertChannelMembership(
     groupId: channel.group_id,
     displayName: profile?.display_name ?? profile?.username ?? "Amigo",
     role,
+    avatarUrl: profile?.avatar_url ?? null,
   };
 }
 
@@ -110,8 +116,48 @@ export async function setVoicePresence(
   await supabaseAdmin
     .from("profiles")
     .update({
-      status: voiceChannelId ? "in_call" : "online",
       voice_channel_id: voiceChannelId,
     })
     .eq("id", userId);
+}
+
+export async function loadGroupVoiceModeration(groupId: string) {
+  const { data } = await supabaseAdmin
+    .from("group_members")
+    .select("user_id, server_muted, server_deafened")
+    .eq("group_id", groupId);
+  return (data ?? [])
+    .filter((row) => row.server_muted || row.server_deafened)
+    .map((row) => ({
+      userId: row.user_id as string,
+      muted: Boolean(row.server_muted),
+      deafened: Boolean(row.server_deafened),
+    }));
+}
+
+function roleRank(role: string) {
+  if (role === "owner") return 3;
+  if (role === "admin") return 2;
+  if (role === "member") return 1;
+  return 0;
+}
+
+export async function assertCanModerateVoice(
+  actorId: string,
+  groupId: string,
+  targetId: string
+) {
+  if (actorId === targetId) throw new Error("Você não pode se moderar");
+  const { data } = await supabaseAdmin
+    .from("group_members")
+    .select("user_id, role")
+    .eq("group_id", groupId)
+    .in("user_id", [actorId, targetId]);
+  const actor = data?.find((r) => r.user_id === actorId);
+  const target = data?.find((r) => r.user_id === targetId);
+  if (!actor || roleRank(actor.role) < 2) throw new Error("Sem permissão");
+  if (!target) throw new Error("Membro não encontrado");
+  if (roleRank(actor.role) <= roleRank(target.role)) {
+    throw new Error("Você não pode moderar este membro");
+  }
 }

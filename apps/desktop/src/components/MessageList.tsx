@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Message, MessageAttachment, MessagePollAgg } from "@molezinha/shared";
 import { parseMentionTokens } from "../lib/notifications";
 import { formatChatTime, formatFullTime } from "../lib/datetime";
@@ -73,9 +73,11 @@ function MessageBody({
 function AttachmentGrid({
   attachments,
   onOpenImage,
+  onMediaLoad,
 }: {
   attachments: MessageAttachment[];
   onOpenImage: (att: MessageAttachment) => void;
+  onMediaLoad?: () => void;
 }) {
   const images = attachments.filter((a) => a.mime_type.startsWith("image/"));
   const files = attachments.filter((a) => !a.mime_type.startsWith("image/"));
@@ -83,17 +85,33 @@ function AttachmentGrid({
     <div className="msg-attachments">
       {images.length > 0 && (
         <div className={`msg-attach-grid count-${Math.min(images.length, 4)}`}>
-          {images.map((a) => (
+          {images.map((a) => {
+            const sized = Boolean(a.width && a.height);
+            return (
             <button
               key={a.id}
               type="button"
-              className="msg-attach-image"
+              className={`msg-attach-image${sized ? " has-size" : ""}`}
+              style={
+                sized
+                  ? { aspectRatio: `${a.width} / ${a.height}` }
+                  : undefined
+              }
               onClick={() => onOpenImage(a)}
               aria-label={`Abrir ${a.file_name}`}
             >
-              <img src={a.file_url} alt={a.file_name} loading="lazy" decoding="async" />
+              <img
+                src={a.file_url}
+                alt={a.file_name}
+                loading="lazy"
+                decoding="async"
+                width={a.width ?? undefined}
+                height={a.height ?? undefined}
+                onLoad={onMediaLoad}
+              />
             </button>
-          ))}
+            );
+          })}
         </div>
       )}
       {files.map((a) => (
@@ -169,6 +187,7 @@ function MessageRow({
   onVotePoll,
   onOpenImage,
   onPlayYoutube,
+  onMediaLoad,
 }: {
   message: Message;
   grouped: boolean;
@@ -184,6 +203,7 @@ function MessageRow({
   onVotePoll?: (pollId: string, optionId: string) => void;
   onOpenImage: (att: MessageAttachment) => void;
   onPlayYoutube?: (url: string) => void;
+  onMediaLoad?: () => void;
 }) {
   const st = Array.isArray(message.stickers) ? message.stickers[0] : message.stickers;
   const stickerUrl = message.sticker_id && st?.file_url ? st.file_url : null;
@@ -268,6 +288,7 @@ function MessageRow({
                   alt={st?.name ?? "figurinha"}
                   loading="lazy"
                   decoding="async"
+                  onLoad={onMediaLoad}
                 />
                 {canSave && (
                   <NeoTooltip label="Salvar na minha coleção" side="top">
@@ -304,7 +325,11 @@ function MessageRow({
           </button>
         )}
         {attachments.length > 0 && (
-          <AttachmentGrid attachments={attachments} onOpenImage={onOpenImage} />
+          <AttachmentGrid
+            attachments={attachments}
+            onOpenImage={onOpenImage}
+            onMediaLoad={onMediaLoad}
+          />
         )}
         {message.poll && <PollCard poll={message.poll} onVote={onVotePoll} />}
         {(message.reactions?.length ?? 0) > 0 && (
@@ -483,19 +508,39 @@ export const MessageList = memo(function MessageList({
   onVotePoll,
   onPlayYoutube,
 }: Props) {
+  const scrollerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef(new Map<string, HTMLElement>());
   const seenIds = useRef<Set<string> | null>(null);
+  const stickToBottom = useRef(true);
+  const didInitialScroll = useRef(false);
   const [flashId, setFlashId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<MessageAttachment | null>(null);
   const unreadTs = unreadSince ? new Date(unreadSince).getTime() : null;
 
   const openImage = useCallback((att: MessageAttachment) => setLightbox(att), []);
 
-  useEffect(() => {
+  const pinToBottom = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
+  const onMediaLoad = useCallback(() => {
+    if (stickToBottom.current) pinToBottom();
+  }, [pinToBottom]);
+
+  useLayoutEffect(() => {
     if (highlightMessageId) return;
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, highlightMessageId]);
+    if (!didInitialScroll.current) {
+      if (messages.length === 0) return;
+      pinToBottom();
+      didInitialScroll.current = true;
+      stickToBottom.current = true;
+      return;
+    }
+    if (stickToBottom.current) pinToBottom();
+  }, [messages, highlightMessageId, pinToBottom]);
 
   useEffect(() => {
     if (!highlightMessageId) {
@@ -525,7 +570,15 @@ export const MessageList = memo(function MessageList({
   }, [messages]);
 
   return (
-    <div className="messages">
+    <div
+      className="messages"
+      ref={scrollerRef}
+      onScroll={() => {
+        const el = scrollerRef.current;
+        if (!el) return;
+        stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+      }}
+    >
       {messages.length === 0 && (
         <EmptyState className="messages-empty" art={emptyArt} title={emptyTitle} hint={emptyHint} />
       )}
@@ -573,6 +626,7 @@ export const MessageList = memo(function MessageList({
               onVotePoll={onVotePoll}
               onOpenImage={openImage}
               onPlayYoutube={onPlayYoutube}
+              onMediaLoad={onMediaLoad}
             />
           </div>
         );
